@@ -158,7 +158,7 @@ const server = new Server(
  */
 async function searchFile(filePath: string, searchTerm: string, page: number = 1, pageSize: number = 10): Promise<any> {
     //replace spaces with underscores
-    searchTerm = searchTerm.replace(" ", "_");
+    searchTerm = searchTerm.replaceAll(" ", "_");
     return new Promise((resolve, reject) => {
         if (!fs.existsSync(filePath)) {
             reject(new Error(`File not found: ${filePath}`));
