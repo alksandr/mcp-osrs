@@ -11,14 +11,157 @@ import axios from 'axios';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import fs from 'fs';
 import path from 'path';
-import readline from 'readline';
 import { fileURLToPath } from 'url';
 import * as cheerio from 'cheerio';
 import TurndownService from 'turndown';
 
+/**
+ * Represents a single drop table entry
+ */
+interface DropTableEntry {
+    item: string;
+    quantity: string;
+    rarity: string;
+    rarityPercent?: string;
+}
+
+/**
+ * Represents a categorized drop table section
+ */
+interface DropTableSection {
+    category: string;
+    drops: DropTableEntry[];
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, 'data');
+
+// File caching for improved performance
+const fileCache: Map<string, { lines: string[], timestamp: number }> = new Map();
+const idIndexCache: Map<string, Map<number, number>> = new Map();
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour cache TTL
+
+// Wiki API response cache
+const wikiCache: Map<string, { data: any, timestamp: number }> = new Map();
+const WIKI_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const WIKI_CACHE_MAX_SIZE = 500;
+
+/**
+ * Get cached file lines or read from disk if cache is expired/missing
+ * @param filePath Path to the file to read
+ * @returns Array of lines from the file
+ */
+function getCachedFileLines(filePath: string): string[] {
+    const now = Date.now();
+    const cached = fileCache.get(filePath);
+
+    // Check if we have a valid cached version
+    if (cached && (now - cached.timestamp) < CACHE_TTL) {
+        return cached.lines;
+    }
+
+    // Read file and cache it
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`File not found: ${filePath}`);
+    }
+
+    const content = fs.readFileSync(filePath, 'utf8');
+    const lines = content.split('\n');
+
+    // Cache the result
+    fileCache.set(filePath, { lines, timestamp: now });
+
+    // Invalidate the ID index cache for this file since content may have changed
+    idIndexCache.delete(filePath);
+
+    return lines;
+}
+
+/**
+ * Build an ID index for fast ID lookups in a file
+ * The index maps ID numbers to their line indices
+ * @param filePath Path to the file
+ * @returns Map of ID to line index
+ */
+function buildIdIndex(filePath: string): Map<number, number> {
+    // Check if we have a cached index
+    const cachedIndex = idIndexCache.get(filePath);
+    if (cachedIndex) {
+        // Verify the file cache is still valid (if file cache expired, index is invalid)
+        const fileEntry = fileCache.get(filePath);
+        if (fileEntry && (Date.now() - fileEntry.timestamp) < CACHE_TTL) {
+            return cachedIndex;
+        }
+    }
+
+    // Build the index from cached lines
+    const lines = getCachedFileLines(filePath);
+    const index = new Map<number, number>();
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        // Extract ID from the beginning of the line (common format: "123\tSomeName")
+        const match = line.match(/^(\d+)/);
+        if (match) {
+            const id = parseInt(match[1], 10);
+            if (!isNaN(id)) {
+                index.set(id, i);
+            }
+        }
+    }
+
+    // Cache the index
+    idIndexCache.set(filePath, index);
+
+    return index;
+}
+
+/**
+ * Generate a cache key from API action and parameters
+ */
+function getWikiCacheKey(action: string, params: Record<string, any>): string {
+    const sortedParams = Object.keys(params)
+        .sort()
+        .map(key => `${key}=${params[key]}`)
+        .join('&');
+    return `${action}:${sortedParams}`;
+}
+
+/**
+ * Get data from wiki cache if valid (not expired)
+ */
+function getFromWikiCache(key: string): any | null {
+    const cached = wikiCache.get(key);
+    if (!cached) return null;
+
+    const now = Date.now();
+    if (now - cached.timestamp > WIKI_CACHE_TTL) {
+        // Expired, remove from cache
+        wikiCache.delete(key);
+        return null;
+    }
+
+    return cached.data;
+}
+
+/**
+ * Store data in wiki cache, evicting oldest entries if at max size
+ */
+function setWikiCache(key: string, data: any): void {
+    // If at max size, evict oldest entry (first entry in Map maintains insertion order)
+    if (wikiCache.size >= WIKI_CACHE_MAX_SIZE) {
+        const oldestKey = wikiCache.keys().next().value;
+        if (oldestKey) {
+            wikiCache.delete(oldestKey);
+        }
+    }
+
+    wikiCache.set(key, {
+        data,
+        timestamp: Date.now()
+    });
+}
 
 const responseToString = (response: any) => {
     const contentText = typeof response === 'string' ? response : JSON.stringify(response);
@@ -49,6 +192,229 @@ function extractInfobox(html: string): Record<string, any> | null {
     });
 
     return Object.keys(infobox).length > 0 ? infobox : null;
+}
+
+/**
+ * Convert rarity string to percentage where possible
+ * Examples: "1/128" -> "0.78%", "Always" -> "100%", "2 x 1/1,024" -> "0.195%"
+ */
+function rarityToPercent(rarity: string): string | undefined {
+    const cleaned = rarity.toLowerCase().trim();
+
+    // Handle "Always" case
+    if (cleaned === 'always') {
+        return '100%';
+    }
+
+    // Handle common rarity terms
+    if (cleaned === 'common') return '~10-20%';
+    if (cleaned === 'uncommon') return '~5-10%';
+    if (cleaned === 'rare') return '~1-5%';
+    if (cleaned === 'very rare') return '<1%';
+
+    // Handle fraction format: "1/128" or "2 x 1/1,024" or "2 × 1/1,024"
+    // First check for multiplier prefix like "2 x" or "2 ×"
+    let multiplier = 1;
+    const multiplierMatch = rarity.match(/^(\d+)\s*[x×]\s*/i);
+    if (multiplierMatch) {
+        multiplier = parseInt(multiplierMatch[1], 10);
+    }
+
+    // Find the fraction part
+    const fractionMatch = rarity.match(/(\d+)\s*\/\s*([\d,]+)/);
+    if (fractionMatch) {
+        const numerator = parseInt(fractionMatch[1].replace(/,/g, ''), 10);
+        const denominator = parseInt(fractionMatch[2].replace(/,/g, ''), 10);
+        if (denominator > 0) {
+            const percentage = (numerator / denominator) * multiplier * 100;
+            // Format nicely based on size
+            if (percentage >= 1) {
+                return `${percentage.toFixed(2)}%`;
+            } else if (percentage >= 0.01) {
+                return `${percentage.toFixed(3)}%`;
+            } else {
+                return `${percentage.toFixed(4)}%`;
+            }
+        }
+    }
+
+    return undefined;
+}
+
+/**
+ * Extract structured drop table data from wiki HTML
+ * Parses OSRS Wiki drop tables which use wikitable class with Item, Quantity, Rarity columns
+ */
+function extractDropTable(html: string): DropTableSection[] {
+    const $ = cheerio.load(html);
+    const dropSections: DropTableSection[] = [];
+
+    // Track current category based on headings
+    let currentCategory = 'Drops';
+
+    // Find all wikitables that appear to be drop tables
+    // Drop tables typically have columns: Item, Quantity, Rarity, Price, High Alch
+    $('table.wikitable').each((_, table) => {
+        const $table = $(table);
+
+        // Check if this looks like a drop table by examining headers
+        const headers: string[] = [];
+        $table.find('th').each((_, th) => {
+            headers.push($(th).text().trim().toLowerCase());
+        });
+
+        // A drop table should have at minimum Item and Rarity columns
+        const hasItemCol = headers.some(h => h.includes('item'));
+        const hasRarityCol = headers.some(h => h.includes('rarity'));
+
+        if (!hasItemCol || !hasRarityCol) {
+            return; // Skip non-drop tables
+        }
+
+        // Try to find the category from a preceding h3/h2/h4 heading
+        const precedingHeading = $table.prevAll('h2, h3, h4').first();
+        if (precedingHeading.length) {
+            // Extract just the text, removing any edit links
+            const headingText = precedingHeading.find('.mw-headline').text().trim() ||
+                               precedingHeading.text().replace(/\[edit\]/gi, '').trim();
+            if (headingText) {
+                currentCategory = headingText;
+            }
+        }
+
+        // Find column indices from header row
+        let itemColIdx = -1;
+        let quantityColIdx = -1;
+        let rarityColIdx = -1;
+
+        $table.find('tr').first().find('th').each((idx, th) => {
+            const text = $(th).text().trim().toLowerCase();
+            if (text.includes('item') && itemColIdx === -1) itemColIdx = idx;
+            if (text.includes('quantity') && quantityColIdx === -1) quantityColIdx = idx;
+            if (text.includes('rarity') && rarityColIdx === -1) rarityColIdx = idx;
+        });
+
+        // If we couldn't find item column in first row, check for tables where first column
+        // is an image and second column is the item name
+        if (itemColIdx === -1) {
+            // Common pattern: first th is blank or "Item" with image, item name is in .item-col
+            const firstRow = $table.find('tr').first();
+            firstRow.find('th').each((idx, th) => {
+                const text = $(th).text().trim().toLowerCase();
+                if (text === '' || text === 'item') {
+                    // Check if next column is also item-related
+                    const nextTh = firstRow.find('th').eq(idx + 1);
+                    if (nextTh.length && nextTh.text().trim().toLowerCase().includes('item')) {
+                        itemColIdx = idx + 1;
+                    } else if (text === '' && idx === 0) {
+                        // Image column, actual item is likely in second column
+                        itemColIdx = 1;
+                    }
+                }
+            });
+
+            // Fallback: assume standard layout (image, item, quantity, rarity, price, alch)
+            if (itemColIdx === -1) {
+                itemColIdx = 1;
+                quantityColIdx = 2;
+                rarityColIdx = 3;
+            }
+        }
+
+        const drops: DropTableEntry[] = [];
+
+        // Parse each data row (skip header row)
+        $table.find('tr').slice(1).each((_, row) => {
+            const $row = $(row);
+            const cells = $row.find('td');
+
+            if (cells.length < 3) return; // Skip rows without enough columns
+
+            // Extract item name - look for .item-col class first, then fall back to column index
+            let itemName = '';
+            const itemCell = $row.find('.item-col');
+            if (itemCell.length) {
+                // Get text from link if present, otherwise direct text
+                const link = itemCell.find('a').first();
+                itemName = link.length ? link.text().trim() : itemCell.text().trim();
+            } else if (itemColIdx >= 0 && cells.eq(itemColIdx).length) {
+                const cell = cells.eq(itemColIdx);
+                const link = cell.find('a').first();
+                itemName = link.length ? link.text().trim() : cell.text().trim();
+            }
+
+            // If no item name from item-col, try to find any anchor in the row as fallback
+            if (!itemName) {
+                const anyLink = $row.find('td a[href^="/w/"]').first();
+                if (anyLink.length) {
+                    itemName = anyLink.attr('title') || anyLink.text().trim();
+                }
+            }
+
+            // Extract quantity
+            let quantity = '';
+            if (quantityColIdx >= 0 && cells.eq(quantityColIdx).length) {
+                quantity = cells.eq(quantityColIdx).text().trim();
+            } else {
+                // Try to find by data-sort-value or just use the cell after item
+                const qtyCell = cells.eq(itemColIdx + 1);
+                if (qtyCell.length) {
+                    quantity = qtyCell.text().trim();
+                }
+            }
+
+            // Extract rarity
+            let rarity = '';
+            if (rarityColIdx >= 0 && cells.eq(rarityColIdx).length) {
+                rarity = cells.eq(rarityColIdx).text().trim();
+            } else {
+                // Try cell after quantity
+                const rarityCell = cells.eq(itemColIdx + 2);
+                if (rarityCell.length) {
+                    rarity = rarityCell.text().trim();
+                }
+            }
+
+            // Clean up the values
+            itemName = itemName.replace(/\s+/g, ' ').trim();
+            quantity = quantity.replace(/\s+/g, ' ').trim();
+            rarity = rarity.replace(/\s+/g, ' ').trim();
+
+            // Skip if we don't have essential data
+            if (!itemName || itemName === 'Nothing' || itemName === 'N/A') return;
+            if (!rarity) return;
+
+            const entry: DropTableEntry = {
+                item: itemName,
+                quantity: quantity || '1',
+                rarity: rarity
+            };
+
+            // Try to convert rarity to percentage
+            const percent = rarityToPercent(rarity);
+            if (percent) {
+                entry.rarityPercent = percent;
+            }
+
+            drops.push(entry);
+        });
+
+        // Only add section if we found drops
+        if (drops.length > 0) {
+            // Check if we already have this category
+            const existingSection = dropSections.find(s => s.category === currentCategory);
+            if (existingSection) {
+                existingSection.drops.push(...drops);
+            } else {
+                dropSections.push({
+                    category: currentCategory,
+                    drops: drops
+                });
+            }
+        }
+    });
+
+    return dropSections;
 }
 
 /**
@@ -127,6 +493,10 @@ const ListDataFilesSchema = z.object({
     fileType: z.string().optional().describe("Optional filter for file type (e.g., 'txt')")
 });
 
+const GetByIdSchema = z.object({
+    id: z.number().int().min(0).describe("The numeric ID to look up")
+});
+
 function convertZodToJsonSchema(schema: z.ZodType<any>) {
   const jsonSchema = zodToJsonSchema(schema);
   delete jsonSchema.$schema;
@@ -149,79 +519,64 @@ const server = new Server(
 );
 
 /**
- * Search through a file for matching lines
+ * Search through a file for matching lines (uses caching for performance)
  * @param filePath Path to the file to search
  * @param searchTerm Term to search for
  * @param page Page number for pagination
  * @param pageSize Number of results per page
  * @returns Object containing results and pagination info
  */
-async function searchFile(filePath: string, searchTerm: string, page: number = 1, pageSize: number = 10): Promise<any> {
-    //replace spaces with underscores
+function searchFile(filePath: string, searchTerm: string, page: number = 1, pageSize: number = 10): any {
+    // Replace spaces with underscores
     searchTerm = searchTerm.replaceAll(" ", "_");
-    return new Promise((resolve, reject) => {
-        if (!fs.existsSync(filePath)) {
-            reject(new Error(`File not found: ${filePath}`));
-            return;
+
+    // Use cached file lines
+    const lines = getCachedFileLines(filePath);
+    const searchTermLower = searchTerm.toLowerCase();
+
+    const results: {line: string, lineNumber: number}[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.toLowerCase().includes(searchTermLower)) {
+            results.push({ line, lineNumber: i + 1 }); // lineNumber is 1-based
         }
+    }
 
-        const results: {line: string, lineNumber: number}[] = [];
-        const fileStream = fs.createReadStream(filePath);
-        const rl = readline.createInterface({
-            input: fileStream,
-            crlfDelay: Infinity
-        });
+    const totalResults = results.length;
+    const totalPages = Math.ceil(totalResults / pageSize);
+    const startIndex = (page - 1) * pageSize;
+    const endIndex = startIndex + pageSize;
+    const paginatedResults = results.slice(startIndex, endIndex);
 
-        let lineNumber = 0;
-        
-        rl.on('line', (line) => {
-            lineNumber++;
-            if (line.toLowerCase().includes(searchTerm.toLowerCase())) {
-                results.push({ line, lineNumber });
-            }
-        });
-
-        rl.on('close', () => {
-            const totalResults = results.length;
-            const totalPages = Math.ceil(totalResults / pageSize);
-            const startIndex = (page - 1) * pageSize;
-            const endIndex = startIndex + pageSize;
-            const paginatedResults = results.slice(startIndex, endIndex);
-
-            // Process the results to extract key-value pairs if possible
-            const formattedResults = paginatedResults.map(result => {
-                // Try to format as key-value pair (common for ID data files)
-                const parts = result.line.split(/\s+/);
-                if (parts.length >= 2) {
-                    const id = parts[0];
-                    const value = parts.slice(1).join(' ');
-                    return {
-                        ...result,
-                        id,
-                        value,
-                        formatted: `${id}\t${value}`
-                    };
-                }
-                return result;
-            });
-
-            resolve({
-                results: formattedResults,
-                pagination: {
-                    page,
-                    pageSize,
-                    totalResults,
-                    totalPages,
-                    hasNextPage: page < totalPages,
-                    hasPreviousPage: page > 1
-                }
-            });
-        });
-
-        rl.on('error', (err) => {
-            reject(err);
-        });
+    // Process the results to extract key-value pairs if possible
+    const formattedResults = paginatedResults.map(result => {
+        // Try to format as key-value pair (common for ID data files)
+        const parts = result.line.split(/\s+/);
+        if (parts.length >= 2) {
+            const id = parts[0];
+            const value = parts.slice(1).join(' ');
+            return {
+                ...result,
+                id,
+                value,
+                formatted: `${id}\t${value}`
+            };
+        }
+        return result;
     });
+
+    return {
+        results: formattedResults,
+        pagination: {
+            page,
+            pageSize,
+            totalResults,
+            totalPages,
+            hasNextPage: page < totalPages,
+            hasPreviousPage: page > 1
+        }
+    };
 }
 
 /**
@@ -263,14 +618,14 @@ function getFileDetails(filename: string): any {
 }
 
 /**
- * Get the number of lines in a file
+ * Get the number of lines in a file (uses caching for performance)
  * @param filePath Path to the file
  * @returns Number of lines in the file
  */
 function getFileLineCount(filePath: string): number {
     try {
-        const content = fs.readFileSync(filePath, 'utf8');
-        return content.split('\n').length;
+        const lines = getCachedFileLines(filePath);
+        return lines.length;
     } catch (error) {
         console.error(`Error counting lines in ${filePath}:`, error);
         return 0;
@@ -285,16 +640,51 @@ function getFileLineCount(filePath: string): number {
 function listDataFiles(fileType?: string): string[] {
     try {
         const files = fs.readdirSync(DATA_DIR);
-        
+
         if (fileType) {
             return files.filter(file => file.endsWith(`.${fileType}`));
         }
-        
+
         return files;
     } catch (error) {
         console.error("Error listing data files:", error);
         return [];
     }
+}
+
+/**
+ * Get an entry by its numeric ID from a data file (uses caching for performance)
+ * @param filePath Path to the file to search
+ * @param id The numeric ID to look up
+ * @returns Object with the entry or null if not found
+ */
+function getEntryById(filePath: string, id: number): any {
+    // Build or get cached ID index for O(1) lookups
+    const idIndex = buildIdIndex(filePath);
+    const lineIndex = idIndex.get(id);
+
+    if (lineIndex === undefined) {
+        return null;
+    }
+
+    // Get the line from cached file content
+    const lines = getCachedFileLines(filePath);
+    const line = lines[lineIndex];
+
+    if (!line) {
+        return null;
+    }
+
+    // Parse the line
+    const parts = line.split(/\t/);
+    const name = parts.length >= 2 ? parts.slice(1).join('\t') : '';
+
+    return {
+        id: id,
+        name: name,
+        lineNumber: lineIndex + 1, // Convert 0-based index to 1-based line number
+        raw: line
+    };
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -312,7 +702,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "osrs_wiki_parse_page",
-                description: "Get parsed content of an OSRS Wiki page. Returns structured JSON with infobox data (stats, combat info), table of contents, and content as markdown.",
+                description: "Get parsed content of an OSRS Wiki page. Returns structured JSON with infobox data (stats, combat info), drop tables with item/quantity/rarity, table of contents, and content as markdown.",
                 inputSchema: convertZodToJsonSchema(OsrsWikiParsePageSchema),
             },
             {
@@ -395,6 +785,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "List available data files in the data directory.",
                 inputSchema: convertZodToJsonSchema(ListDataFilesSchema),
             },
+            {
+                name: "get_npctype_by_id",
+                description: "Get NPC definition by ID from npctypes.txt. Returns the NPC name and details for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_objtype_by_id",
+                description: "Get item/object definition by ID from objtypes.txt. Returns the item name and details for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_seqtype_by_id",
+                description: "Get animation sequence by ID from seqtypes.txt. Returns the animation name and details for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_spottype_by_id",
+                description: "Get spot animation (graphical effect) by ID from spottypes.txt. Returns the spotanim name and details for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_loctype_by_id",
+                description: "Get location/object definition by ID from loctypes.txt. Returns the location name and details for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
         ]
     };
 });
@@ -404,41 +819,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     try {
         switch (name) {
-            case "osrs_wiki_search":
+            case "osrs_wiki_search": {
                 const { search, limit = 10, offset = 0 } = OsrsWikiSearchSchema.parse(args);
-                const searchResponse = await osrsApiClient.get('', {
-                    params: {
-                        action: 'query',
-                        list: 'search',
-                        srsearch: search,
-                        srlimit: limit,
-                        sroffset: offset,
-                        srprop: 'snippet|titlesnippet|sectiontitle'
-                    }
-                });
+                const searchParams = {
+                    action: 'query',
+                    list: 'search',
+                    srsearch: search,
+                    srlimit: limit,
+                    sroffset: offset,
+                    srprop: 'snippet|titlesnippet|sectiontitle'
+                };
+                const searchCacheKey = getWikiCacheKey('wiki_search', searchParams);
+                const cachedSearchData = getFromWikiCache(searchCacheKey);
+                if (cachedSearchData) {
+                    return responseToString(cachedSearchData);
+                }
+                const searchResponse = await osrsApiClient.get('', { params: searchParams });
+                setWikiCache(searchCacheKey, searchResponse.data);
                 return responseToString(searchResponse.data);
+            }
 
-            case "osrs_wiki_get_page_info":
+            case "osrs_wiki_get_page_info": {
                 const { titles } = OsrsWikiGetPageInfoSchema.parse(args);
-                const pageInfoResponse = await osrsApiClient.get('', {
-                    params: {
-                        action: 'query',
-                        prop: 'info',
-                        titles: titles
-                    }
-                });
+                const pageInfoParams = {
+                    action: 'query',
+                    prop: 'info',
+                    titles: titles
+                };
+                const pageInfoCacheKey = getWikiCacheKey('wiki_page_info', pageInfoParams);
+                const cachedPageInfoData = getFromWikiCache(pageInfoCacheKey);
+                if (cachedPageInfoData) {
+                    return responseToString(cachedPageInfoData);
+                }
+                const pageInfoResponse = await osrsApiClient.get('', { params: pageInfoParams });
+                setWikiCache(pageInfoCacheKey, pageInfoResponse.data);
                 return responseToString(pageInfoResponse.data);
+            }
 
-            case "osrs_wiki_parse_page":
+            case "osrs_wiki_parse_page": {
                 const { page } = OsrsWikiParsePageSchema.parse(args);
-                const parseResponse = await osrsApiClient.get('', {
-                    params: {
-                        action: 'parse',
-                        page: page,
-                        prop: 'text|sections',
-                        formatversion: 2
-                    }
-                });
+                const parseParams = {
+                    action: 'parse',
+                    page: page,
+                    prop: 'text|sections',
+                    formatversion: 2
+                };
+                const parseCacheKey = getWikiCacheKey('wiki_parse_page', parseParams);
+                const cachedParseData = getFromWikiCache(parseCacheKey);
+                if (cachedParseData) {
+                    return responseToString(cachedParseData);
+                }
+
+                const parseResponse = await osrsApiClient.get('', { params: parseParams });
 
                 const rawHtml = parseResponse.data?.parse?.text;
                 if (!rawHtml) {
@@ -446,6 +878,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 }
 
                 const infobox = extractInfobox(rawHtml);
+                const dropTable = extractDropTable(rawHtml);
                 const content = cleanAndConvertHtml(rawHtml);
                 const sections = parseResponse.data?.parse?.sections?.map((s: any) => ({
                     level: s.level,
@@ -453,12 +886,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     anchor: s.anchor
                 })) || [];
 
-                return responseToString({
+                const parseResult = {
                     page: page,
                     infobox: infobox,
+                    dropTable: dropTable.length > 0 ? dropTable : null,
                     sections: sections,
                     content: content
-                });
+                };
+                setWikiCache(parseCacheKey, parseResult);
+                return responseToString(parseResult);
+            }
 
             case "search_varptypes":
             case "search_varbittypes":
@@ -515,6 +952,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const { fileType } = ListDataFilesSchema.parse(args);
                 const files = listDataFiles(fileType);
                 return responseToString({ files, path: DATA_DIR });
+
+            case "get_npctype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const npcFilePath = path.join(DATA_DIR, 'npctypes.txt');
+                if (!fileExists('npctypes.txt')) {
+                    return responseToString({ error: 'npctypes.txt not found in data directory' });
+                }
+                const npcEntry = await getEntryById(npcFilePath, id);
+                if (npcEntry === null) {
+                    return responseToString({ error: `NPC with ID ${id} not found` });
+                }
+                return responseToString(npcEntry);
+            }
+
+            case "get_objtype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const objFilePath = path.join(DATA_DIR, 'objtypes.txt');
+                if (!fileExists('objtypes.txt')) {
+                    return responseToString({ error: 'objtypes.txt not found in data directory' });
+                }
+                const objEntry = await getEntryById(objFilePath, id);
+                if (objEntry === null) {
+                    return responseToString({ error: `Object/Item with ID ${id} not found` });
+                }
+                return responseToString(objEntry);
+            }
+
+            case "get_seqtype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const seqFilePath = path.join(DATA_DIR, 'seqtypes.txt');
+                if (!fileExists('seqtypes.txt')) {
+                    return responseToString({ error: 'seqtypes.txt not found in data directory' });
+                }
+                const seqEntry = await getEntryById(seqFilePath, id);
+                if (seqEntry === null) {
+                    return responseToString({ error: `Animation sequence with ID ${id} not found` });
+                }
+                return responseToString(seqEntry);
+            }
+
+            case "get_spottype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const spotFilePath = path.join(DATA_DIR, 'spottypes.txt');
+                if (!fileExists('spottypes.txt')) {
+                    return responseToString({ error: 'spottypes.txt not found in data directory' });
+                }
+                const spotEntry = await getEntryById(spotFilePath, id);
+                if (spotEntry === null) {
+                    return responseToString({ error: `Spot animation with ID ${id} not found` });
+                }
+                return responseToString(spotEntry);
+            }
+
+            case "get_loctype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const locFilePath = path.join(DATA_DIR, 'loctypes.txt');
+                if (!fileExists('loctypes.txt')) {
+                    return responseToString({ error: 'loctypes.txt not found in data directory' });
+                }
+                const locEntry = await getEntryById(locFilePath, id);
+                if (locEntry === null) {
+                    return responseToString({ error: `Location with ID ${id} not found` });
+                }
+                return responseToString(locEntry);
+            }
 
             default:
                 throw new Error(`Unknown tool: ${name}`);
