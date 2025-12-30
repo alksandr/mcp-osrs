@@ -13,6 +13,8 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
+import * as cheerio from 'cheerio';
+import TurndownService from 'turndown';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,6 +26,64 @@ const responseToString = (response: any) => {
         content: [{ type: "text", text: contentText }]
     };
 };
+
+/**
+ * Extract structured data from wiki infobox tables
+ */
+function extractInfobox(html: string): Record<string, any> | null {
+    const $ = cheerio.load(html);
+    const infobox: Record<string, any> = {};
+
+    // Find infobox tables (various classes used by OSRS wiki)
+    const infoboxTable = $('.infobox-monster, .infobox-item, .infobox-bonuses, .infobox').first();
+    if (!infoboxTable.length) return null;
+
+    // Extract all key-value pairs from rows
+    infoboxTable.find('tr').each((_, row) => {
+        const $row = $(row);
+        const header = $row.find('th').text().trim().toLowerCase().replace(/\s+/g, '_');
+        const value = $row.find('td').text().trim();
+        if (header && value) {
+            infobox[header] = value;
+        }
+    });
+
+    return Object.keys(infobox).length > 0 ? infobox : null;
+}
+
+/**
+ * Clean HTML and convert to markdown
+ */
+function cleanAndConvertHtml(html: string): string {
+    const $ = cheerio.load(html);
+
+    // Remove unwanted elements
+    $('.navbox, .mbox, .hatnote, .toc, .mw-editsection, .reference, ' +
+      '.references, .external, .noprint, script, style, .infobox').remove();
+
+    // Remove "See also", "References", "External links" sections
+    $('h2, h3').each((_, el) => {
+        const text = $(el).text().toLowerCase();
+        if (text.includes('see also') || text.includes('references') ||
+            text.includes('external links') || text.includes('navigation')) {
+            $(el).nextUntil('h2').remove();
+            $(el).remove();
+        }
+    });
+
+    // Convert to markdown
+    const turndown = new TurndownService({
+        headingStyle: 'atx',
+        codeBlockStyle: 'fenced'
+    });
+
+    // Get main content area
+    const content = $('.mw-parser-output').html() || $.html();
+    const markdown = turndown.turndown(content);
+
+    // Clean up excessive whitespace
+    return markdown.replace(/\n{3,}/g, '\n\n').trim();
+}
 
 const osrsApiClient = axios.create({
     baseURL: 'https://oldschool.runescape.wiki/api.php',
@@ -252,7 +312,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "osrs_wiki_parse_page",
-                description: "Get the parsed HTML content of a specific OSRS Wiki page.",
+                description: "Get parsed content of an OSRS Wiki page. Returns structured JSON with infobox data (stats, combat info), table of contents, and content as markdown.",
                 inputSchema: convertZodToJsonSchema(OsrsWikiParsePageSchema),
             },
             {
@@ -375,11 +435,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     params: {
                         action: 'parse',
                         page: page,
-                        prop: 'text',
+                        prop: 'text|sections',
                         formatversion: 2
                     }
                 });
-                return responseToString(parseResponse.data?.parse?.text || 'Page content not found.');
+
+                const rawHtml = parseResponse.data?.parse?.text;
+                if (!rawHtml) {
+                    return responseToString({ error: 'Page content not found.' });
+                }
+
+                const infobox = extractInfobox(rawHtml);
+                const content = cleanAndConvertHtml(rawHtml);
+                const sections = parseResponse.data?.parse?.sections?.map((s: any) => ({
+                    level: s.level,
+                    title: s.line,
+                    anchor: s.anchor
+                })) || [];
+
+                return responseToString({
+                    page: page,
+                    infobox: infobox,
+                    sections: sections,
+                    content: content
+                });
 
             case "search_varptypes":
             case "search_varbittypes":
