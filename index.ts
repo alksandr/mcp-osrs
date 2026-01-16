@@ -14,6 +14,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import * as cheerio from 'cheerio';
 import TurndownService from 'turndown';
+import http from 'http';
+import https from 'https';
 
 /**
  * Represents a single drop table entry
@@ -33,6 +35,53 @@ interface DropTableSection {
     drops: DropTableEntry[];
 }
 
+/**
+ * Represents a drop entry from osrsreboxed-db
+ */
+interface OsrsBoxDrop {
+    id: number;
+    name: string;
+    members: boolean;
+    quantity: string;
+    noted: boolean;
+    rarity: number;  // Decimal rarity e.g., 0.003333 = 1/300
+    rolls: number;
+}
+
+/**
+ * Represents a monster from osrsreboxed-db
+ */
+interface OsrsBoxMonster {
+    id: number;
+    name: string;
+    combat_level: number;
+    hitpoints: number;
+    wiki_url: string;
+    drops: OsrsBoxDrop[];
+}
+
+/**
+ * Represents an item source entry for reverse lookups
+ */
+interface ItemSourceEntry {
+    monsterId: number;
+    monsterName: string;
+    combatLevel: number;
+    rarity: number;
+    quantity: string;
+    noted: boolean;
+}
+
+/**
+ * Cache structure for osrsreboxed-db data
+ */
+interface OsrsBoxCache {
+    monsters: Map<number, OsrsBoxMonster>;
+    monsterNameIndex: Map<string, number[]>;  // lowercase name -> monster IDs
+    itemDropIndex: Map<number, ItemSourceEntry[]>;  // item ID -> sources
+    timestamp: number;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.join(__dirname, 'data');
@@ -47,6 +96,21 @@ const wikiCache: Map<string, { data: any, timestamp: number }> = new Map();
 const WIKI_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 const WIKI_CACHE_MAX_SIZE = 500;
 
+// Cache statistics tracking
+let fileCacheHits = 0;
+let fileCacheMisses = 0;
+let wikiCacheHits = 0;
+let wikiCacheMisses = 0;
+
+// osrsreboxed-db cache (in-memory + disk)
+let osrsBoxCache: OsrsBoxCache | null = null;
+const OSRSBOX_CACHE_TTL = 24 * 60 * 60 * 1000;  // 24 hours
+const OSRSBOX_CACHE_FILE = 'osrsbox-monsters.json';
+const OSRSBOX_GITHUB_URL = 'https://raw.githubusercontent.com/0xNeffarion/osrsreboxed-db/master/docs/monsters-complete.json';
+
+// Environment variable for optional startup refresh of osrsbox data
+const REFRESH_OSRSBOX_ON_STARTUP = process.env.OSRS_REFRESH_OSRSBOX === 'true';
+
 /**
  * Get cached file lines or read from disk if cache is expired/missing
  * @param filePath Path to the file to read
@@ -58,10 +122,13 @@ function getCachedFileLines(filePath: string): string[] {
 
     // Check if we have a valid cached version
     if (cached && (now - cached.timestamp) < CACHE_TTL) {
+        fileCacheHits++;
         return cached.lines;
     }
 
-    // Read file and cache it
+    // Cache miss - read file from disk
+    fileCacheMisses++;
+
     if (!fs.existsSync(filePath)) {
         throw new Error(`File not found: ${filePath}`);
     }
@@ -133,15 +200,20 @@ function getWikiCacheKey(action: string, params: Record<string, any>): string {
  */
 function getFromWikiCache(key: string): any | null {
     const cached = wikiCache.get(key);
-    if (!cached) return null;
+    if (!cached) {
+        wikiCacheMisses++;
+        return null;
+    }
 
     const now = Date.now();
     if (now - cached.timestamp > WIKI_CACHE_TTL) {
         // Expired, remove from cache
         wikiCache.delete(key);
+        wikiCacheMisses++;
         return null;
     }
 
+    wikiCacheHits++;
     return cached.data;
 }
 
@@ -161,6 +233,23 @@ function setWikiCache(key: string, data: any): void {
         data,
         timestamp: Date.now()
     });
+}
+
+// Request deduplication - prevents duplicate in-flight requests
+const pendingRequests = new Map<string, Promise<any>>();
+
+async function fetchWithDedup<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
+    const existing = pendingRequests.get(key);
+    if (existing) {
+        return existing as Promise<T>;
+    }
+
+    const promise = fetcher().finally(() => {
+        pendingRequests.delete(key);
+    });
+
+    pendingRequests.set(key, promise);
+    return promise;
 }
 
 const responseToString = (response: any) => {
@@ -271,16 +360,22 @@ function extractDropTable(html: string): DropTableSection[] {
             return; // Skip non-drop tables
         }
 
-        // Find the closest preceding heading by traversing siblings
-        // This fixes category misassignment for pages with multiple drop tables
+        // Find the best preceding heading by traversing siblings
+        // Prefer higher-level headings (h2 > h3 > h4) as they represent main sections
         let currentElement = $table.prev();
-        let precedingHeading: ReturnType<typeof $> | null = null;
+        let bestHeading: { element: ReturnType<typeof $> | null, level: number } = { element: null, level: 5 };
 
         while (currentElement.length > 0) {
-            if (currentElement.is('h2, h3, h4')) {
-                precedingHeading = currentElement;
-                break;
+            // Check for headings and track the best one (lowest level number = highest priority)
+            if (currentElement.is('h2')) {
+                bestHeading = { element: currentElement, level: 2 };
+                break; // h2 is authoritative, stop here
+            } else if (currentElement.is('h3') && bestHeading.level > 3) {
+                bestHeading = { element: currentElement, level: 3 };
+            } else if (currentElement.is('h4') && bestHeading.level > 4) {
+                bestHeading = { element: currentElement, level: 4 };
             }
+
             // If we hit another drop table, stop (category belongs to that table)
             if (currentElement.is('table.wikitable') && currentElement.find('th').toArray().some(th =>
                 $(th).text().toLowerCase().includes('rarity'))) {
@@ -289,10 +384,9 @@ function extractDropTable(html: string): DropTableSection[] {
             currentElement = currentElement.prev();
         }
 
-        if (precedingHeading && precedingHeading.length) {
-            // Extract just the text, removing any edit links
-            const headingText = precedingHeading.find('.mw-headline').text().trim() ||
-                               precedingHeading.text().replace(/\[edit\]/gi, '').trim();
+        if (bestHeading.element && bestHeading.element.length) {
+            const headingText = bestHeading.element.find('.mw-headline').text().trim() ||
+                               bestHeading.element.text().replace(/\[edit\]/gi, '').trim();
             if (headingText) {
                 currentCategory = headingText;
             }
@@ -602,11 +696,17 @@ function extractSections(content: string, sectionTitles: string[]): string {
     return matchedSections.map(s => s.content).join('\n\n');
 }
 
+// HTTP agents with keep-alive for connection reuse
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
+
 const osrsApiClient = axios.create({
     baseURL: 'https://oldschool.runescape.wiki/api.php',
     params: {
         format: 'json'
-    }
+    },
+    httpsAgent: httpsAgent,
+    timeout: 15000
 });
 
 // Grand Exchange price API client
@@ -614,7 +714,9 @@ const geApiClient = axios.create({
     baseURL: 'https://prices.runescape.wiki/api/v1/osrs',
     headers: {
         'User-Agent': 'mcp-osrs/1.0 (https://github.com/jayarrowz/mcp-osrs)'
-    }
+    },
+    httpsAgent: httpsAgent,
+    timeout: 15000
 });
 
 // GE cache with 5-minute TTL (prices update frequently)
@@ -788,6 +890,189 @@ async function updateSoundIdsFromWiki(dryRun: boolean = false): Promise<UpdateSo
     return result;
 }
 
+/**
+ * Convert decimal rarity to human-readable fraction string
+ * @param rarity Decimal rarity (e.g., 0.003333)
+ * @returns Fraction string (e.g., "1/300") or "Always" for 1.0
+ */
+function rarityToFraction(rarity: number): string {
+    if (rarity >= 1) return 'Always';
+    if (rarity <= 0) return 'Never';
+
+    // Calculate denominator
+    const denominator = Math.round(1 / rarity);
+    return `1/${denominator.toLocaleString()}`;
+}
+
+/**
+ * Build indexes from raw monster data
+ */
+function buildOsrsBoxIndexes(monsters: OsrsBoxMonster[]): OsrsBoxCache {
+    const monsterMap = new Map<number, OsrsBoxMonster>();
+    const nameIndex = new Map<string, number[]>();
+    const itemDropIndex = new Map<number, ItemSourceEntry[]>();
+
+    for (const monster of monsters) {
+        // Add to ID map
+        monsterMap.set(monster.id, monster);
+
+        // Add to name index (lowercase for case-insensitive search)
+        const nameLower = monster.name.toLowerCase();
+        const existing = nameIndex.get(nameLower) || [];
+        existing.push(monster.id);
+        nameIndex.set(nameLower, existing);
+
+        // Build inverted item drop index
+        if (monster.drops) {
+            for (const drop of monster.drops) {
+                const sources = itemDropIndex.get(drop.id) || [];
+                sources.push({
+                    monsterId: monster.id,
+                    monsterName: monster.name,
+                    combatLevel: monster.combat_level,
+                    rarity: drop.rarity,
+                    quantity: drop.quantity,
+                    noted: drop.noted
+                });
+                itemDropIndex.set(drop.id, sources);
+            }
+        }
+    }
+
+    return {
+        monsters: monsterMap,
+        monsterNameIndex: nameIndex,
+        itemDropIndex: itemDropIndex,
+        timestamp: Date.now()
+    };
+}
+
+/**
+ * Fetch osrsreboxed-db data from GitHub
+ * @param saveToDisk Whether to save data to disk cache
+ * @returns Update result with statistics
+ */
+async function fetchOsrsBoxData(saveToDisk: boolean = true): Promise<{
+    success: boolean;
+    monsterCount: number;
+    totalDrops: number;
+    uniqueItems: number;
+    dryRun: boolean;
+    filePath?: string;
+    error?: string;
+}> {
+    const response = await axios.get(OSRSBOX_GITHUB_URL);
+    const rawData = response.data;
+
+    // The data is an object with monster IDs as keys
+    const monsters: OsrsBoxMonster[] = Object.values(rawData);
+
+    if (monsters.length === 0) {
+        throw new Error('No monsters found in osrsreboxed-db data');
+    }
+
+    // Validate minimum expected count
+    if (monsters.length < 1000) {
+        throw new Error(
+            `Only ${monsters.length} monsters found, expected 2800+. ` +
+            `Data structure may have changed.`
+        );
+    }
+
+    // Count total drops and unique items
+    let totalDrops = 0;
+    const uniqueItemIds = new Set<number>();
+
+    for (const monster of monsters) {
+        if (monster.drops) {
+            totalDrops += monster.drops.length;
+            for (const drop of monster.drops) {
+                uniqueItemIds.add(drop.id);
+            }
+        }
+    }
+
+    const result = {
+        success: true,
+        monsterCount: monsters.length,
+        totalDrops,
+        uniqueItems: uniqueItemIds.size,
+        dryRun: !saveToDisk
+    };
+
+    if (saveToDisk) {
+        const filePath = path.join(DATA_DIR, OSRSBOX_CACHE_FILE);
+        fs.writeFileSync(filePath, JSON.stringify(rawData), 'utf8');
+        (result as any).filePath = filePath;
+
+        // Rebuild in-memory cache
+        osrsBoxCache = buildOsrsBoxIndexes(monsters);
+    }
+
+    return result;
+}
+
+/**
+ * Load osrsreboxed-db data from disk cache
+ * @returns Whether data was loaded successfully
+ */
+function loadOsrsBoxFromDisk(): boolean {
+    const filePath = path.join(DATA_DIR, OSRSBOX_CACHE_FILE);
+
+    if (!fs.existsSync(filePath)) {
+        return false;
+    }
+
+    try {
+        const stats = fs.statSync(filePath);
+        const age = Date.now() - stats.mtimeMs;
+
+        // Check if cache is expired
+        if (age > OSRSBOX_CACHE_TTL) {
+            return false;
+        }
+
+        const content = fs.readFileSync(filePath, 'utf8');
+        const rawData = JSON.parse(content);
+        const monsters: OsrsBoxMonster[] = Object.values(rawData);
+
+        osrsBoxCache = buildOsrsBoxIndexes(monsters);
+        return true;
+    } catch (error) {
+        console.error('[mcp-osrs] Failed to load osrsbox cache from disk:', error);
+        return false;
+    }
+}
+
+/**
+ * Get osrsreboxed-db cache, loading from disk or fetching from GitHub if needed
+ * @param forceRefresh Force a refresh from GitHub
+ * @returns The cache object or null if unavailable
+ */
+async function getOsrsBoxCache(forceRefresh: boolean = false): Promise<OsrsBoxCache | null> {
+    // Check if we have valid memory cache
+    if (!forceRefresh && osrsBoxCache) {
+        const age = Date.now() - osrsBoxCache.timestamp;
+        if (age < OSRSBOX_CACHE_TTL) {
+            return osrsBoxCache;
+        }
+    }
+
+    // Try to load from disk cache
+    if (!forceRefresh && loadOsrsBoxFromDisk()) {
+        return osrsBoxCache;
+    }
+
+    // Fetch from GitHub
+    try {
+        await fetchOsrsBoxData(true);
+        return osrsBoxCache;
+    } catch (error) {
+        console.error('[mcp-osrs] Failed to fetch osrsbox data:', error);
+        return null;
+    }
+}
+
 const OsrsWikiSearchSchema = z.object({
     search: z.string().describe("The term to search for on the OSRS Wiki"),
     limit: z.number().int().min(1).max(50).optional().describe("Number of results to return (1-50)"),
@@ -853,6 +1138,89 @@ const GEPriceSchema = z.object({
 const GEPriceBulkSchema = z.object({
     itemIds: z.array(z.number().int().min(0)).max(100)
         .describe("Array of item IDs to get prices for (max 100)")
+});
+
+// Phase 3 Schemas
+const CacheStatsSchema = z.object({});
+
+const HiscoresSchema = z.object({
+    username: z.string().describe("Player username"),
+    gameMode: z.enum(['normal', 'ironman', 'hardcore', 'ultimate'])
+        .optional().default('normal')
+        .describe("Game mode for hiscores lookup")
+});
+
+const RegexSearchSchema = z.object({
+    pattern: z.string().describe("Regex pattern to match against entry names"),
+    filename: z.string().describe("Data file to search (e.g., 'objtypes.txt')"),
+    flags: z.string().optional().default("i").describe("Regex flags (default: 'i' for case-insensitive)"),
+    page: z.number().int().min(1).optional().default(1).describe("Page number"),
+    pageSize: z.number().int().min(1).max(100).optional().default(10).describe("Results per page")
+});
+
+// Hiscores skill names in order
+const HISCORE_SKILLS = [
+    'Overall', 'Attack', 'Defence', 'Strength', 'Hitpoints', 'Ranged',
+    'Prayer', 'Magic', 'Cooking', 'Woodcutting', 'Fletching', 'Fishing',
+    'Firemaking', 'Crafting', 'Smithing', 'Mining', 'Herblore', 'Agility',
+    'Thieving', 'Slayer', 'Farming', 'Runecraft', 'Hunter', 'Construction'
+];
+
+// Phase 4 Schemas
+const RangeQuerySchema = z.object({
+    filename: z.string().describe("Data file to query (e.g., 'objtypes.txt')"),
+    startId: z.number().int().min(0).describe("Starting ID (inclusive)"),
+    endId: z.number().int().min(0).describe("Ending ID (inclusive)"),
+    limit: z.number().int().min(1).max(1000).optional().default(100)
+        .describe("Maximum results to return (default 100, max 1000)")
+});
+
+const WikiImagesSchema = z.object({
+    page: z.string().describe("The exact title of the wiki page (e.g., 'Abyssal whip', 'Zulrah')")
+});
+
+// Drop Table Tool Schemas
+const WikiGetDropsSchema = z.object({
+    pages: z.union([
+        z.string(),
+        z.array(z.string())
+    ]).describe("Page title(s) to get drops from. Can be a single page name or array of names."),
+    include_categories: z.boolean().optional().default(true)
+        .describe("Include category names in output (default: true)")
+});
+
+const UpdateOsrsBoxSchema = z.object({
+    dryRun: z.boolean().optional().default(false)
+        .describe("If true, fetch and return stats without writing to disk")
+});
+
+const MonsterDropsSchema = z.object({
+    monster_id: z.number().int().min(0).describe("Monster ID to get drops for"),
+    include_ge_prices: z.boolean().optional().default(false)
+        .describe("Include current GE prices for dropped items")
+});
+
+const MonsterDropsByNameSchema = z.object({
+    monster_name: z.string().describe("Monster name to search for (case-insensitive)"),
+    include_ge_prices: z.boolean().optional().default(false)
+        .describe("Include current GE prices for dropped items"),
+    page: z.number().int().min(1).optional().default(1)
+        .describe("Page number for pagination"),
+    pageSize: z.number().int().min(1).max(50).optional().default(10)
+        .describe("Number of monsters per page (max 50)")
+});
+
+const ItemSourcesSchema = z.object({
+    item_id: z.number().int().min(0).optional()
+        .describe("Item ID to find sources for"),
+    item_name: z.string().optional()
+        .describe("Item name to find sources for (partial match, case-insensitive)"),
+    min_rarity: z.number().min(0).max(1).optional()
+        .describe("Minimum rarity threshold (0.0-1.0, e.g., 0.01 = 1%)"),
+    limit: z.number().int().min(1).max(500).optional().default(50)
+        .describe("Maximum results to return (default 50, max 500)")
+}).refine(data => data.item_id !== undefined || data.item_name !== undefined, {
+    message: "Either item_id or item_name must be provided"
 });
 
 function convertZodToJsonSchema(schema: z.ZodType<any>) {
@@ -965,6 +1333,97 @@ function findByExactName(filePath: string, name: string): any {
         }
     }
     return null;
+}
+
+/**
+ * Search file using regex pattern matching
+ * @param filePath Path to the file to search
+ * @param pattern Regex pattern to match
+ * @param flags Regex flags
+ * @param page Page number for pagination
+ * @param pageSize Results per page
+ * @returns Search results with pagination
+ */
+function searchFileRegex(filePath: string, pattern: string, flags: string, page: number, pageSize: number): any {
+    const lines = getCachedFileLines(filePath);
+
+    let regex: RegExp;
+    try {
+        regex = new RegExp(pattern, flags);
+    } catch (e) {
+        throw new Error(`Invalid regex pattern: ${pattern}`);
+    }
+
+    const results: { line: string; lineNumber: number }[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (regex.test(line)) {
+            results.push({ line, lineNumber: i + 1 });
+        }
+    }
+
+    const totalResults = results.length;
+    const totalPages = Math.ceil(totalResults / pageSize);
+    const startIndex = (page - 1) * pageSize;
+    const paginatedResults = results.slice(startIndex, startIndex + pageSize);
+
+    const formattedResults = paginatedResults.map(result => {
+        const parts = result.line.split(/\t/);
+        if (parts.length >= 2) {
+            return {
+                ...result,
+                id: parseInt(parts[0], 10),
+                name: parts[1]
+            };
+        }
+        return result;
+    });
+
+    return {
+        pattern,
+        results: formattedResults,
+        pagination: { page, pageSize, totalResults, totalPages }
+    };
+}
+
+/**
+ * Extract image URLs from wiki HTML
+ * @param html The HTML content of the wiki page
+ * @returns Object containing image URLs (detail, inventory, chathead)
+ */
+function extractWikiImages(html: string): Record<string, string> {
+    const $ = cheerio.load(html);
+    const images: Record<string, string> = {};
+
+    // Find infobox image (usually the main item/NPC image)
+    const infoboxImage = $('.infobox-image img, .infobox img').first();
+    if (infoboxImage.length) {
+        const src = infoboxImage.attr('src');
+        if (src) {
+            images.detail = src.startsWith('//') ? `https:${src}` : src;
+        }
+    }
+
+    // Find inventory image (items have this)
+    const invImage = $('img[alt*="inventory" i], img[src*="inventory" i]').first();
+    if (invImage.length) {
+        const src = invImage.attr('src');
+        if (src) {
+            images.inventory = src.startsWith('//') ? `https:${src}` : src;
+        }
+    }
+
+    // Find chathead image (NPCs have this)
+    const chatheadImage = $('img[alt*="chathead" i], img[src*="chathead" i]').first();
+    if (chatheadImage.length) {
+        const src = chatheadImage.attr('src');
+        if (src) {
+            images.chathead = src.startsWith('//') ? `https:${src}` : src;
+        }
+    }
+
+    return images;
 }
 
 /**
@@ -1160,7 +1619,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "search_data_file",
-                description: "Search any file in the data directory for matching entries.",
+                description: "Search any file in the data directory for matching entries. Available files typically include: varptypes, varbittypes, iftypes, invtypes, loctypes, npctypes, objtypes, rowtypes, seqtypes, soundtypes, spottypes, spritetypes, tabletypes, soundids. Additional files like enumtypes, structtypes, paramtypes may also be available if added to the data directory.",
                 inputSchema: convertZodToJsonSchema(GenericFileSearchSchema),
             },
             {
@@ -1319,6 +1778,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Get multiple table definitions by IDs from tabletypes.txt. Returns results array and notFound array.",
                 inputSchema: convertZodToJsonSchema(BulkLookupSchema),
             },
+            {
+                name: "get_soundids_by_ids",
+                description: "Get multiple sound effects by IDs from soundids.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
             // Phase 2: Exact match tools
             {
                 name: "find_objtype_by_name",
@@ -1335,6 +1799,56 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Find a location/object by exact name (case-insensitive) from loctypes.txt. Spaces are converted to underscores.",
                 inputSchema: convertZodToJsonSchema(ExactMatchSchema),
             },
+            {
+                name: "find_seqtype_by_name",
+                description: "Find an animation sequence by exact name (case-insensitive) from seqtypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_spottype_by_name",
+                description: "Find a spot animation by exact name (case-insensitive) from spottypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_varptype_by_name",
+                description: "Find a player variable by exact name (case-insensitive) from varptypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_varbittype_by_name",
+                description: "Find a variable bit by exact name (case-insensitive) from varbittypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_iftype_by_name",
+                description: "Find an interface by exact name (case-insensitive) from iftypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_invtype_by_name",
+                description: "Find an inventory type by exact name (case-insensitive) from invtypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_rowtype_by_name",
+                description: "Find a row definition by exact name (case-insensitive) from rowtypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_soundtype_by_name",
+                description: "Find a sound type by exact name (case-insensitive) from soundtypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_spritetype_by_name",
+                description: "Find a sprite by exact name (case-insensitive) from spritetypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_tabletype_by_name",
+                description: "Find a table definition by exact name (case-insensitive) from tabletypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
             // Phase 2: GE price tools
             {
                 name: "osrs_ge_price",
@@ -1345,6 +1859,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 name: "osrs_ge_prices",
                 description: "Get Grand Exchange prices for multiple items by IDs. Returns results array and notFound array.",
                 inputSchema: convertZodToJsonSchema(GEPriceBulkSchema),
+            },
+            // Phase 3: Polish tools
+            {
+                name: "get_cache_stats",
+                description: "Get cache statistics for debugging and monitoring. Shows file cache and wiki cache hit rates.",
+                inputSchema: convertZodToJsonSchema(CacheStatsSchema),
+            },
+            {
+                name: "osrs_hiscores",
+                description: "Look up a player's stats and rankings from the OSRS hiscores. Supports normal, ironman, hardcore, and ultimate game modes.",
+                inputSchema: convertZodToJsonSchema(HiscoresSchema),
+            },
+            {
+                name: "search_regex",
+                description: "Search a data file using regex pattern matching. Useful for finding items matching patterns like 'dragon_.*_ornament'.",
+                inputSchema: convertZodToJsonSchema(RegexSearchSchema),
+            },
+            // Phase 4 Tools
+            {
+                name: "get_id_range",
+                description: "Get all entries within an ID range from a data file. Useful for exploring ID ranges to find related items/NPCs/objects.",
+                inputSchema: convertZodToJsonSchema(RangeQuerySchema),
+            },
+            {
+                name: "osrs_wiki_images",
+                description: "Extract image URLs (detail, inventory sprite, chathead) from an OSRS Wiki page. Useful for getting item/NPC images.",
+                inputSchema: convertZodToJsonSchema(WikiImagesSchema),
+            },
+            // Drop Table Tools
+            {
+                name: "osrs_wiki_get_drops",
+                description: "Get ONLY drop tables from wiki pages. Lightweight alternative to osrs_wiki_parse_page when you only need drops. Supports multiple pages in one call.",
+                inputSchema: convertZodToJsonSchema(WikiGetDropsSchema),
+            },
+            {
+                name: "update_osrsbox_data",
+                description: "Update local cache of osrsreboxed-db monster data from GitHub. Downloads ~50MB of structured drop data with numeric rarity values. Use dryRun=true to preview without saving.",
+                inputSchema: convertZodToJsonSchema(UpdateOsrsBoxSchema),
+            },
+            {
+                name: "osrs_get_monster_drops",
+                description: "Get drops for a monster by ID from osrsreboxed-db. Returns structured data with numeric rarity values (decimal, e.g., 0.003333 = 1/300).",
+                inputSchema: convertZodToJsonSchema(MonsterDropsSchema),
+            },
+            {
+                name: "osrs_search_monster_drops",
+                description: "Search for monsters by name and get their drops from osrsreboxed-db. Returns all monsters matching the name with their drops.",
+                inputSchema: convertZodToJsonSchema(MonsterDropsByNameSchema),
+            },
+            {
+                name: "osrs_get_item_sources",
+                description: "Reverse drop lookup: find all monsters that drop a specific item. Specify item_id OR item_name. Returns sources sorted by rarity (best first).",
+                inputSchema: convertZodToJsonSchema(ItemSourcesSchema),
             },
         ]
     };
@@ -1370,7 +1937,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 if (cachedSearchData) {
                     return responseToString(cachedSearchData);
                 }
-                const searchResponse = await osrsApiClient.get('', { params: searchParams });
+                const searchResponse = await fetchWithDedup(searchCacheKey, () =>
+                    osrsApiClient.get('', { params: searchParams })
+                );
                 // Strip HTML tags from snippets
                 if (searchResponse.data?.query?.search) {
                     searchResponse.data.query.search = searchResponse.data.query.search.map((result: any) => ({
@@ -1395,7 +1964,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 if (cachedPageInfoData) {
                     return responseToString(cachedPageInfoData);
                 }
-                const pageInfoResponse = await osrsApiClient.get('', { params: pageInfoParams });
+                const pageInfoResponse = await fetchWithDedup(pageInfoCacheKey, () =>
+                    osrsApiClient.get('', { params: pageInfoParams })
+                );
                 setWikiCache(pageInfoCacheKey, pageInfoResponse.data);
                 return responseToString(pageInfoResponse.data);
             }
@@ -1421,7 +1992,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     return responseToString(cachedParseData);
                 }
 
-                const parseResponse = await osrsApiClient.get('', { params: parseParams });
+                const parseResponse = await fetchWithDedup(parseCacheKey, () =>
+                    osrsApiClient.get('', { params: parseParams })
+                );
 
                 const rawHtml = parseResponse.data?.parse?.text;
                 if (!rawHtml) {
@@ -1727,6 +2300,971 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return responseToString(entry);
             }
 
+            // Phase 2: Bulk ID lookup handlers
+            case "get_npctypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'npctypes.txt');
+                if (!fileExists('npctypes.txt')) {
+                    return responseToString({ error: 'npctypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_objtypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'objtypes.txt');
+                if (!fileExists('objtypes.txt')) {
+                    return responseToString({ error: 'objtypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_seqtypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'seqtypes.txt');
+                if (!fileExists('seqtypes.txt')) {
+                    return responseToString({ error: 'seqtypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_spottypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'spottypes.txt');
+                if (!fileExists('spottypes.txt')) {
+                    return responseToString({ error: 'spottypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_loctypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'loctypes.txt');
+                if (!fileExists('loctypes.txt')) {
+                    return responseToString({ error: 'loctypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_varptypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'varptypes.txt');
+                if (!fileExists('varptypes.txt')) {
+                    return responseToString({ error: 'varptypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_varbittypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'varbittypes.txt');
+                if (!fileExists('varbittypes.txt')) {
+                    return responseToString({ error: 'varbittypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_iftypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'iftypes.txt');
+                if (!fileExists('iftypes.txt')) {
+                    return responseToString({ error: 'iftypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_invtypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'invtypes.txt');
+                if (!fileExists('invtypes.txt')) {
+                    return responseToString({ error: 'invtypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_rowtypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'rowtypes.txt');
+                if (!fileExists('rowtypes.txt')) {
+                    return responseToString({ error: 'rowtypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_soundtypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'soundtypes.txt');
+                if (!fileExists('soundtypes.txt')) {
+                    return responseToString({ error: 'soundtypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_spritetypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'spritetypes.txt');
+                if (!fileExists('spritetypes.txt')) {
+                    return responseToString({ error: 'spritetypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_tabletypes_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'tabletypes.txt');
+                if (!fileExists('tabletypes.txt')) {
+                    return responseToString({ error: 'tabletypes.txt not found' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            case "get_soundids_by_ids": {
+                const { ids } = BulkLookupSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'soundids.txt');
+                if (!fileExists('soundids.txt')) {
+                    return responseToString({ error: 'soundids.txt not found. Use update_soundids_from_wiki to download.' });
+                }
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const id of ids) {
+                    const entry = getEntryById(filePath, id);
+                    if (entry === null) {
+                        notFound.push(id);
+                    } else {
+                        results.push(entry);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            // Phase 2: Exact match handlers
+            case "find_objtype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'objtypes.txt');
+                if (!fileExists('objtypes.txt')) {
+                    return responseToString({ error: 'objtypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Object with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_npctype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'npctypes.txt');
+                if (!fileExists('npctypes.txt')) {
+                    return responseToString({ error: 'npctypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `NPC with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_loctype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'loctypes.txt');
+                if (!fileExists('loctypes.txt')) {
+                    return responseToString({ error: 'loctypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Location with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_seqtype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'seqtypes.txt');
+                if (!fileExists('seqtypes.txt')) {
+                    return responseToString({ error: 'seqtypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Animation sequence with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_spottype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'spottypes.txt');
+                if (!fileExists('spottypes.txt')) {
+                    return responseToString({ error: 'spottypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Spot animation with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_varptype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'varptypes.txt');
+                if (!fileExists('varptypes.txt')) {
+                    return responseToString({ error: 'varptypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Player variable with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_varbittype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'varbittypes.txt');
+                if (!fileExists('varbittypes.txt')) {
+                    return responseToString({ error: 'varbittypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Variable bit with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_iftype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'iftypes.txt');
+                if (!fileExists('iftypes.txt')) {
+                    return responseToString({ error: 'iftypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Interface with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_invtype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'invtypes.txt');
+                if (!fileExists('invtypes.txt')) {
+                    return responseToString({ error: 'invtypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Inventory type with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_rowtype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'rowtypes.txt');
+                if (!fileExists('rowtypes.txt')) {
+                    return responseToString({ error: 'rowtypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Row definition with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_soundtype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'soundtypes.txt');
+                if (!fileExists('soundtypes.txt')) {
+                    return responseToString({ error: 'soundtypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Sound type with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_spritetype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'spritetypes.txt');
+                if (!fileExists('spritetypes.txt')) {
+                    return responseToString({ error: 'spritetypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Sprite with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "find_tabletype_by_name": {
+                const { name: searchName } = ExactMatchSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'tabletypes.txt');
+                if (!fileExists('tabletypes.txt')) {
+                    return responseToString({ error: 'tabletypes.txt not found' });
+                }
+                const entry = findByExactName(filePath, searchName);
+                if (entry === null) {
+                    return responseToString({ error: `Table definition with name "${searchName}" not found` });
+                }
+                return responseToString(entry);
+            }
+
+            // Phase 2: GE price handlers
+            case "osrs_ge_price": {
+                const { itemId } = GEPriceSchema.parse(args);
+                const priceData = await getGEPrices();
+                const itemPrice = priceData.data?.[itemId.toString()];
+                if (!itemPrice) {
+                    return responseToString({ error: `No GE price data for item ID ${itemId}` });
+                }
+                return responseToString({
+                    itemId,
+                    high: itemPrice.high,
+                    highTime: itemPrice.highTime,
+                    low: itemPrice.low,
+                    lowTime: itemPrice.lowTime
+                });
+            }
+
+            case "osrs_ge_prices": {
+                const { itemIds } = GEPriceBulkSchema.parse(args);
+                const priceData = await getGEPrices();
+                const results: any[] = [];
+                const notFound: number[] = [];
+                for (const itemId of itemIds) {
+                    const itemPrice = priceData.data?.[itemId.toString()];
+                    if (itemPrice) {
+                        results.push({
+                            itemId,
+                            high: itemPrice.high,
+                            highTime: itemPrice.highTime,
+                            low: itemPrice.low,
+                            lowTime: itemPrice.lowTime
+                        });
+                    } else {
+                        notFound.push(itemId);
+                    }
+                }
+                return responseToString({ results, notFound });
+            }
+
+            // Phase 3: Polish tool handlers
+            case "get_cache_stats": {
+                const totalFileRequests = fileCacheHits + fileCacheMisses;
+                const totalWikiRequests = wikiCacheHits + wikiCacheMisses;
+
+                return responseToString({
+                    fileCache: {
+                        entries: fileCache.size,
+                        hits: fileCacheHits,
+                        misses: fileCacheMisses,
+                        hitRate: totalFileRequests > 0
+                            ? `${((fileCacheHits / totalFileRequests) * 100).toFixed(1)}%`
+                            : "N/A",
+                        ttlMinutes: CACHE_TTL / 60000
+                    },
+                    wikiCache: {
+                        entries: wikiCache.size,
+                        hits: wikiCacheHits,
+                        misses: wikiCacheMisses,
+                        hitRate: totalWikiRequests > 0
+                            ? `${((wikiCacheHits / totalWikiRequests) * 100).toFixed(1)}%`
+                            : "N/A",
+                        maxSize: WIKI_CACHE_MAX_SIZE,
+                        ttlMinutes: WIKI_CACHE_TTL / 60000
+                    },
+                    geCache: {
+                        cached: gePriceCache !== null,
+                        ttlMinutes: GE_CACHE_TTL / 60000
+                    }
+                });
+            }
+
+            case "osrs_hiscores": {
+                const { username, gameMode = 'normal' } = HiscoresSchema.parse(args);
+
+                const gameModeUrls: Record<string, string> = {
+                    'normal': 'hiscore_oldschool',
+                    'ironman': 'hiscore_oldschool_ironman',
+                    'hardcore': 'hiscore_oldschool_hardcore_ironman',
+                    'ultimate': 'hiscore_oldschool_ultimate'
+                };
+
+                const url = `https://secure.runescape.com/m=${gameModeUrls[gameMode]}/index_lite.json?player=${encodeURIComponent(username)}`;
+
+                try {
+                    const response = await axios.get(url);
+                    const data = response.data;
+
+                    // Parse skills from response
+                    const skills: Record<string, { rank: number; level: number; xp: number }> = {};
+                    if (data.skills) {
+                        for (let i = 0; i < HISCORE_SKILLS.length && i < data.skills.length; i++) {
+                            const skill = data.skills[i];
+                            skills[HISCORE_SKILLS[i]] = {
+                                rank: skill.rank,
+                                level: skill.level,
+                                xp: skill.xp
+                            };
+                        }
+                    }
+
+                    return responseToString({
+                        username,
+                        gameMode,
+                        skills
+                    });
+                } catch (error) {
+                    const err = error as any;
+                    if (err.response?.status === 404) {
+                        return responseToString({ error: `Player "${username}" not found on ${gameMode} hiscores` });
+                    }
+                    throw error;
+                }
+            }
+
+            case "search_regex": {
+                const { pattern, filename, flags = 'i', page = 1, pageSize = 10 } = RegexSearchSchema.parse(args);
+
+                // Security check
+                if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+                    throw new Error('Invalid filename');
+                }
+
+                if (!fileExists(filename)) {
+                    return responseToString({ error: `${filename} not found in data directory` });
+                }
+
+                const filePath = path.join(DATA_DIR, filename);
+                const results = searchFileRegex(filePath, pattern, flags, page, pageSize);
+                return responseToString(results);
+            }
+
+            // Phase 4 Handlers
+            case "get_id_range": {
+                const { filename, startId, endId, limit = 100 } = RangeQuerySchema.parse(args);
+
+                // Security check
+                if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+                    throw new Error('Invalid filename');
+                }
+
+                if (!fileExists(filename)) {
+                    return responseToString({ error: `${filename} not found in data directory` });
+                }
+
+                if (startId > endId) {
+                    return responseToString({ error: 'startId must be <= endId' });
+                }
+
+                const filePath = path.join(DATA_DIR, filename);
+                const idIndex = buildIdIndex(filePath);
+                const lines = getCachedFileLines(filePath);
+                const results: any[] = [];
+
+                for (let id = startId; id <= endId && results.length < limit; id++) {
+                    const lineIndex = idIndex.get(id);
+                    if (lineIndex !== undefined) {
+                        const line = lines[lineIndex];
+                        const parts = line.split(/\t/);
+                        results.push({
+                            id,
+                            name: parts.length >= 2 ? parts[1] : '',
+                            lineNumber: lineIndex + 1
+                        });
+                    }
+                }
+
+                return responseToString({
+                    filename,
+                    startId,
+                    endId,
+                    limit,
+                    count: results.length,
+                    results
+                });
+            }
+
+            case "osrs_wiki_images": {
+                const { page } = WikiImagesSchema.parse(args);
+                const parseParams = {
+                    action: 'parse',
+                    page: page,
+                    prop: 'text',
+                    formatversion: 2
+                };
+
+                const cacheKey = getWikiCacheKey('wiki_images', { page });
+                const cached = getFromWikiCache(cacheKey);
+                if (cached) {
+                    return responseToString(cached);
+                }
+
+                const response = await fetchWithDedup(cacheKey, () =>
+                    osrsApiClient.get('', { params: parseParams })
+                );
+                const html = response.data?.parse?.text;
+
+                if (!html) {
+                    return responseToString({ error: 'Page not found or has no content' });
+                }
+
+                const images = extractWikiImages(html);
+                const result = { page, images };
+
+                setWikiCache(cacheKey, result);
+                return responseToString(result);
+            }
+
+            // Drop Table Tool Handlers
+            case "osrs_wiki_get_drops": {
+                const { pages, include_categories = true } = WikiGetDropsSchema.parse(args);
+                const pageList = Array.isArray(pages) ? pages : [pages];
+                const results: Record<string, any> = {};
+
+                for (const pageName of pageList) {
+                    // Check cache first
+                    const cacheKey = getWikiCacheKey('wiki_drops', { page: pageName });
+                    const cached = getFromWikiCache(cacheKey);
+
+                    if (cached) {
+                        results[pageName] = cached;
+                        continue;
+                    }
+
+                    // Fetch wiki page
+                    const parseParams = {
+                        action: 'parse',
+                        page: pageName,
+                        prop: 'text',
+                        formatversion: 2
+                    };
+
+                    try {
+                        const response = await fetchWithDedup(cacheKey, () =>
+                            osrsApiClient.get('', { params: parseParams })
+                        );
+                        const html = response.data?.parse?.text;
+
+                        if (!html) {
+                            results[pageName] = { error: 'Page not found' };
+                            continue;
+                        }
+
+                        const dropTable = extractDropTable(html);
+
+                        // Format output based on include_categories
+                        let pageResult;
+                        if (include_categories) {
+                            pageResult = dropTable;
+                        } else {
+                            // Flatten all drops without categories
+                            const allDrops = dropTable.flatMap(section => section.drops);
+                            pageResult = allDrops;
+                        }
+
+                        setWikiCache(cacheKey, pageResult);
+                        results[pageName] = pageResult;
+                    } catch (error) {
+                        const err = error as Error;
+                        results[pageName] = { error: err.message };
+                    }
+                }
+
+                // If single page was requested, return just that result
+                if (pageList.length === 1) {
+                    return responseToString(results[pageList[0]]);
+                }
+                return responseToString(results);
+            }
+
+            case "update_osrsbox_data": {
+                const { dryRun = false } = UpdateOsrsBoxSchema.parse(args);
+                try {
+                    const result = await fetchOsrsBoxData(!dryRun);
+                    return responseToString(result);
+                } catch (error) {
+                    const err = error as Error;
+                    return responseToString({
+                        error: `Failed to update osrsbox data: ${err.message}`
+                    });
+                }
+            }
+
+            case "osrs_get_monster_drops": {
+                const { monster_id, include_ge_prices = false } = MonsterDropsSchema.parse(args);
+
+                const cache = await getOsrsBoxCache();
+                if (!cache) {
+                    return responseToString({
+                        error: 'osrsreboxed-db data not available. Use update_osrsbox_data to download.'
+                    });
+                }
+
+                const monster = cache.monsters.get(monster_id);
+                if (!monster) {
+                    return responseToString({ error: `Monster ID ${monster_id} not found` });
+                }
+
+                // Format drops with rarity strings
+                const formattedDrops = monster.drops?.map(drop => ({
+                    id: drop.id,
+                    name: drop.name,
+                    quantity: drop.quantity,
+                    rarity: drop.rarity,
+                    rarity_fraction: rarityToFraction(drop.rarity),
+                    rarity_percent: `${(drop.rarity * 100).toFixed(4)}%`,
+                    noted: drop.noted,
+                    members: drop.members
+                })) || [];
+
+                let result: any = {
+                    id: monster.id,
+                    name: monster.name,
+                    combat_level: monster.combat_level,
+                    hitpoints: monster.hitpoints,
+                    wiki_url: monster.wiki_url,
+                    drops: formattedDrops
+                };
+
+                // Add GE prices if requested
+                if (include_ge_prices && formattedDrops.length > 0) {
+                    try {
+                        const priceData = await getGEPrices();
+                        result.drops = formattedDrops.map(drop => {
+                            const itemPrice = priceData.data?.[drop.id.toString()];
+                            return {
+                                ...drop,
+                                ge_price: itemPrice ? {
+                                    high: itemPrice.high,
+                                    low: itemPrice.low
+                                } : null
+                            };
+                        });
+                    } catch (error) {
+                        // Continue without prices if GE API fails
+                    }
+                }
+
+                return responseToString(result);
+            }
+
+            case "osrs_search_monster_drops": {
+                const { monster_name, include_ge_prices = false, page = 1, pageSize = 10 } = MonsterDropsByNameSchema.parse(args);
+
+                const cache = await getOsrsBoxCache();
+                if (!cache) {
+                    return responseToString({
+                        error: 'osrsreboxed-db data not available. Use update_osrsbox_data to download.'
+                    });
+                }
+
+                const searchLower = monster_name.toLowerCase();
+                const matchingMonsters: OsrsBoxMonster[] = [];
+
+                // Search through name index for partial matches
+                for (const [name, ids] of cache.monsterNameIndex) {
+                    if (name.includes(searchLower)) {
+                        for (const id of ids) {
+                            const monster = cache.monsters.get(id);
+                            if (monster) {
+                                matchingMonsters.push(monster);
+                            }
+                        }
+                    }
+                }
+
+                if (matchingMonsters.length === 0) {
+                    return responseToString({ error: `No monsters found matching "${monster_name}"` });
+                }
+
+                // Pagination
+                const totalResults = matchingMonsters.length;
+                const totalPages = Math.ceil(totalResults / pageSize);
+                const startIndex = (page - 1) * pageSize;
+                const paginatedMonsters = matchingMonsters.slice(startIndex, startIndex + pageSize);
+
+                // Format results
+                const results = paginatedMonsters.map(monster => {
+                    const formattedDrops = monster.drops?.map(drop => ({
+                        id: drop.id,
+                        name: drop.name,
+                        quantity: drop.quantity,
+                        rarity: drop.rarity,
+                        rarity_fraction: rarityToFraction(drop.rarity),
+                        rarity_percent: `${(drop.rarity * 100).toFixed(4)}%`,
+                        noted: drop.noted
+                    })) || [];
+
+                    return {
+                        id: monster.id,
+                        name: monster.name,
+                        combat_level: monster.combat_level,
+                        hitpoints: monster.hitpoints,
+                        wiki_url: monster.wiki_url,
+                        drop_count: formattedDrops.length,
+                        drops: formattedDrops
+                    };
+                });
+
+                // Add GE prices if requested
+                if (include_ge_prices) {
+                    try {
+                        const priceData = await getGEPrices();
+                        for (const result of results) {
+                            result.drops = result.drops.map((drop: any) => {
+                                const itemPrice = priceData.data?.[drop.id.toString()];
+                                return {
+                                    ...drop,
+                                    ge_price: itemPrice ? {
+                                        high: itemPrice.high,
+                                        low: itemPrice.low
+                                    } : null
+                                };
+                            });
+                        }
+                    } catch (error) {
+                        // Continue without prices
+                    }
+                }
+
+                return responseToString({
+                    query: monster_name,
+                    totalResults,
+                    pagination: {
+                        page,
+                        pageSize,
+                        totalPages,
+                        hasNextPage: page < totalPages,
+                        hasPreviousPage: page > 1
+                    },
+                    monsters: results
+                });
+            }
+
+            case "osrs_get_item_sources": {
+                const { item_id, item_name, min_rarity, limit = 50 } = ItemSourcesSchema.parse(args);
+
+                const cache = await getOsrsBoxCache();
+                if (!cache) {
+                    return responseToString({
+                        error: 'osrsreboxed-db data not available. Use update_osrsbox_data to download.'
+                    });
+                }
+
+                let sources: ItemSourceEntry[] = [];
+                let matchedItemId: number | null = null;
+                let matchedItemName: string | null = null;
+
+                if (item_id !== undefined) {
+                    // Direct ID lookup (O(1))
+                    sources = cache.itemDropIndex.get(item_id) || [];
+                    matchedItemId = item_id;
+
+                    // Try to get item name from objtypes
+                    const objFilePath = path.join(DATA_DIR, 'objtypes.txt');
+                    if (fileExists('objtypes.txt')) {
+                        const entry = getEntryById(objFilePath, item_id);
+                        if (entry) {
+                            matchedItemName = entry.name;
+                        }
+                    }
+                } else if (item_name) {
+                    // Search by name - find matching item IDs first
+                    const searchLower = item_name.toLowerCase();
+                    const matchedItems: { id: number; name: string }[] = [];
+
+                    // Search through all item drop entries
+                    for (const [itemId, itemSources] of cache.itemDropIndex) {
+                        if (itemSources.length > 0) {
+                            // Get item name from first source's drop list
+                            const monster = cache.monsters.get(itemSources[0].monsterId);
+                            if (monster?.drops) {
+                                const drop = monster.drops.find(d => d.id === itemId);
+                                if (drop && drop.name.toLowerCase().includes(searchLower)) {
+                                    matchedItems.push({ id: itemId, name: drop.name });
+                                }
+                            }
+                        }
+                    }
+
+                    if (matchedItems.length === 0) {
+                        return responseToString({ error: `No items found matching "${item_name}"` });
+                    }
+
+                    // If multiple items match, show them
+                    if (matchedItems.length > 1) {
+                        return responseToString({
+                            message: `Multiple items match "${item_name}". Use item_id for specific item.`,
+                            matches: matchedItems.slice(0, 20)
+                        });
+                    }
+
+                    // Single match
+                    matchedItemId = matchedItems[0].id;
+                    matchedItemName = matchedItems[0].name;
+                    sources = cache.itemDropIndex.get(matchedItemId) || [];
+                }
+
+                // Apply rarity filter
+                if (min_rarity !== undefined) {
+                    sources = sources.filter(s => s.rarity >= min_rarity);
+                }
+
+                // Sort by rarity (best/highest first)
+                sources.sort((a, b) => b.rarity - a.rarity);
+
+                // Apply limit
+                sources = sources.slice(0, limit);
+
+                // Format output
+                const formattedSources = sources.map(source => ({
+                    monster_id: source.monsterId,
+                    monster_name: source.monsterName,
+                    combat_level: source.combatLevel,
+                    quantity: source.quantity,
+                    noted: source.noted,
+                    rarity: source.rarity,
+                    rarity_fraction: rarityToFraction(source.rarity),
+                    rarity_percent: `${(source.rarity * 100).toFixed(4)}%`
+                }));
+
+                return responseToString({
+                    item_id: matchedItemId,
+                    item_name: matchedItemName,
+                    source_count: formattedSources.length,
+                    sources: formattedSources
+                });
+            }
+
             default:
                 throw new Error(`Unknown tool: ${name}`);
         }
@@ -1765,8 +3303,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 });
 
+// Files to pre-warm on startup (most commonly used)
+const PREWARM_FILES = ['objtypes.txt', 'npctypes.txt', 'loctypes.txt', 'seqtypes.txt'];
+
+async function prewarmFileCache(): Promise<void> {
+    console.error('[mcp-osrs] Pre-warming file caches...');
+    let loaded = 0;
+
+    for (const filename of PREWARM_FILES) {
+        const filePath = path.join(DATA_DIR, filename);
+        try {
+            if (fs.existsSync(filePath)) {
+                getCachedFileLines(filePath);
+                buildIdIndex(filePath);
+                loaded++;
+            }
+        } catch (error) {
+            // Non-fatal: continue with other files
+        }
+    }
+
+    console.error(`[mcp-osrs] Pre-warmed ${loaded} file caches`);
+}
+
 async function main() {
     try {
+        // Pre-warm file caches for commonly used data files
+        await prewarmFileCache();
+
         // Optional startup refresh of sound IDs from wiki
         if (REFRESH_SOUNDIDS_ON_STARTUP) {
             try {
@@ -1776,6 +3340,19 @@ async function main() {
             } catch (error) {
                 const err = error as Error;
                 console.error(`[mcp-osrs] Failed to refresh sound IDs: ${err.message}`);
+                // Non-fatal: continue startup even if refresh fails
+            }
+        }
+
+        // Optional startup refresh of osrsreboxed-db data
+        if (REFRESH_OSRSBOX_ON_STARTUP) {
+            try {
+                console.error('[mcp-osrs] Refreshing osrsreboxed-db from GitHub...');
+                const result = await fetchOsrsBoxData(true);
+                console.error(`[mcp-osrs] osrsreboxed-db updated: ${result.monsterCount} monsters, ${result.totalDrops} drops`);
+            } catch (error) {
+                const err = error as Error;
+                console.error(`[mcp-osrs] Failed to refresh osrsreboxed-db: ${err.message}`);
                 // Non-fatal: continue startup even if refresh fails
             }
         }
@@ -1792,3 +3369,6 @@ main().catch((error) => {
     console.error("Fatal error in main():", error);
     process.exit(1);
 });
+
+// Export for testing
+export { searchFile, rarityToPercent, extractDropTable, getEntryById, findByExactName, getCachedFileLines };
