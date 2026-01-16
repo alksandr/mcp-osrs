@@ -67,7 +67,7 @@ function getCachedFileLines(filePath: string): string[] {
     }
 
     const content = fs.readFileSync(filePath, 'utf8');
-    const lines = content.split('\n');
+    const lines = content.split('\n').map(line => line.replace(/\r$/, ''));
 
     // Cache the result
     fileCache.set(filePath, { lines, timestamp: now });
@@ -271,9 +271,25 @@ function extractDropTable(html: string): DropTableSection[] {
             return; // Skip non-drop tables
         }
 
-        // Try to find the category from a preceding h3/h2/h4 heading
-        const precedingHeading = $table.prevAll('h2, h3, h4').first();
-        if (precedingHeading.length) {
+        // Find the closest preceding heading by traversing siblings
+        // This fixes category misassignment for pages with multiple drop tables
+        let currentElement = $table.prev();
+        let precedingHeading: ReturnType<typeof $> | null = null;
+
+        while (currentElement.length > 0) {
+            if (currentElement.is('h2, h3, h4')) {
+                precedingHeading = currentElement;
+                break;
+            }
+            // If we hit another drop table, stop (category belongs to that table)
+            if (currentElement.is('table.wikitable') && currentElement.find('th').toArray().some(th =>
+                $(th).text().toLowerCase().includes('rarity'))) {
+                break;
+            }
+            currentElement = currentElement.prev();
+        }
+
+        if (precedingHeading && precedingHeading.length) {
             // Extract just the text, removing any edit links
             const headingText = precedingHeading.find('.mw-headline').text().trim() ||
                                precedingHeading.text().replace(/\[edit\]/gi, '').trim();
@@ -451,12 +467,326 @@ function cleanAndConvertHtml(html: string): string {
     return markdown.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+/**
+ * Result from truncating content
+ */
+interface TruncateResult {
+    content: string;
+    truncated: boolean;
+    originalLength: number;
+    truncatedAtSection?: string;
+}
+
+/**
+ * Truncate content to a maximum length, preferring to cut at section boundaries
+ * @param content The markdown content to truncate
+ * @param maxLength Maximum length in characters
+ * @returns Truncation result with metadata
+ */
+function truncateContent(content: string, maxLength: number): TruncateResult {
+    const originalLength = content.length;
+
+    // If content is under the limit, return unchanged
+    if (originalLength <= maxLength) {
+        return {
+            content,
+            truncated: false,
+            originalLength
+        };
+    }
+
+    // Reserve space for truncation message
+    const truncationMsg = '\n\n---\n*[Content truncated. Use sections parameter to request specific sections, or increase max_content_length.]*';
+    const targetLength = maxLength - truncationMsg.length;
+
+    if (targetLength <= 0) {
+        return {
+            content: truncationMsg.trim(),
+            truncated: true,
+            originalLength
+        };
+    }
+
+    // Try to find a good cut point
+    const searchRegion = content.substring(0, targetLength + 500); // Look a bit ahead for better cut points
+
+    // Priority 1: Cut at a markdown heading (## or ###)
+    const headingMatches = [...searchRegion.matchAll(/\n#{2,3}\s+([^\n]+)/g)];
+    let cutPoint = -1;
+    let truncatedAtSection: string | undefined;
+
+    // Find the last heading that starts before our target length
+    for (const match of headingMatches) {
+        if (match.index !== undefined && match.index <= targetLength) {
+            cutPoint = match.index;
+            truncatedAtSection = match[1].trim();
+        }
+    }
+
+    // Priority 2: Cut at a paragraph break (double newline)
+    if (cutPoint === -1) {
+        const lastParaBreak = content.lastIndexOf('\n\n', targetLength);
+        if (lastParaBreak > targetLength * 0.5) { // Only use if we keep at least 50%
+            cutPoint = lastParaBreak;
+        }
+    }
+
+    // Priority 3: Hard cut at target length
+    if (cutPoint === -1) {
+        cutPoint = targetLength;
+    }
+
+    const truncatedContent = content.substring(0, cutPoint).trim() + truncationMsg;
+
+    return {
+        content: truncatedContent,
+        truncated: true,
+        originalLength,
+        truncatedAtSection
+    };
+}
+
+/**
+ * Extract specific sections from markdown content by title
+ * @param content The full markdown content
+ * @param sectionTitles Array of section titles to extract (case-insensitive partial match)
+ * @returns Filtered markdown content containing only matched sections
+ */
+function extractSections(content: string, sectionTitles: string[]): string {
+    if (!sectionTitles || sectionTitles.length === 0) {
+        return content;
+    }
+
+    // Normalize section titles for matching
+    const normalizedTitles = sectionTitles.map(t => t.toLowerCase().trim());
+
+    // Split content into sections based on markdown headings
+    // Match ## and ### level headings
+    const sectionRegex = /^(#{2,3})\s+(.+)$/gm;
+    const sections: { title: string; level: number; start: number; content: string }[] = [];
+
+    let match;
+    const matches: { title: string; level: number; start: number }[] = [];
+
+    while ((match = sectionRegex.exec(content)) !== null) {
+        matches.push({
+            title: match[2].trim(),
+            level: match[1].length,
+            start: match.index
+        });
+    }
+
+    // Extract content for each section
+    for (let i = 0; i < matches.length; i++) {
+        const current = matches[i];
+        const nextStart = i < matches.length - 1 ? matches[i + 1].start : content.length;
+        const sectionContent = content.substring(current.start, nextStart).trim();
+
+        sections.push({
+            ...current,
+            content: sectionContent
+        });
+    }
+
+    // Filter to matching sections
+    const matchedSections = sections.filter(section => {
+        const sectionTitleLower = section.title.toLowerCase();
+        return normalizedTitles.some(t => sectionTitleLower.includes(t) || t.includes(sectionTitleLower));
+    });
+
+    if (matchedSections.length === 0) {
+        return `*[No sections matching: ${sectionTitles.join(', ')}]*\n\nAvailable sections:\n${sections.map(s => `- ${s.title}`).join('\n')}`;
+    }
+
+    // Combine matched sections
+    return matchedSections.map(s => s.content).join('\n\n');
+}
+
 const osrsApiClient = axios.create({
     baseURL: 'https://oldschool.runescape.wiki/api.php',
     params: {
         format: 'json'
     }
 });
+
+// Grand Exchange price API client
+const geApiClient = axios.create({
+    baseURL: 'https://prices.runescape.wiki/api/v1/osrs',
+    headers: {
+        'User-Agent': 'mcp-osrs/1.0 (https://github.com/jayarrowz/mcp-osrs)'
+    }
+});
+
+// GE cache with 5-minute TTL (prices update frequently)
+const GE_CACHE_TTL = 5 * 60 * 1000;
+let gePriceCache: { data: any; timestamp: number } | null = null;
+
+/**
+ * Get GE price data, using cache if valid
+ */
+async function getGEPrices(): Promise<any> {
+    const now = Date.now();
+    if (gePriceCache && (now - gePriceCache.timestamp) < GE_CACHE_TTL) {
+        return gePriceCache.data;
+    }
+
+    const response = await geApiClient.get('/latest');
+    gePriceCache = { data: response.data, timestamp: now };
+    return response.data;
+}
+
+// Environment variable for optional startup refresh of sound IDs
+const REFRESH_SOUNDIDS_ON_STARTUP = process.env.OSRS_REFRESH_SOUNDIDS === 'true';
+
+/**
+ * Represents a sound ID entry from the wiki
+ */
+interface SoundIdEntry {
+    id: number;
+    name: string;
+}
+
+/**
+ * Result from updating sound IDs from wiki
+ */
+interface UpdateSoundIdsResult {
+    success: boolean;
+    entriesFound: number;
+    entriesWritten?: number;
+    idRange?: { min: number; max: number };
+    dryRun: boolean;
+    filePath?: string;
+    error?: string;
+}
+
+/**
+ * Parse sound ID tables from OSRS Wiki HTML
+ * @param html Raw HTML from the wiki page
+ * @returns Array of sound ID entries
+ */
+function parseSoundIdTables(html: string): SoundIdEntry[] {
+    const $ = cheerio.load(html);
+    const entries: SoundIdEntry[] = [];
+    const seenIds = new Set<number>();
+
+    // Find all wikitables on the page
+    $('table.wikitable').each((_, table) => {
+        const $table = $(table);
+
+        // Get headers from the first row
+        const headers: string[] = [];
+        $table.find('tr').first().find('th').each((_, th) => {
+            headers.push($(th).text().trim().toLowerCase());
+        });
+
+        // Must have 'id' and 'sound' columns
+        const idColIdx = headers.findIndex(h => h === 'id');
+        const soundColIdx = headers.findIndex(h => h === 'sound');
+
+        if (idColIdx === -1 || soundColIdx === -1) {
+            return; // Skip non-sound-ID tables
+        }
+
+        // Parse each data row
+        $table.find('tr').slice(1).each((_, row) => {
+            const cells = $(row).find('td');
+            if (cells.length < 2) return;
+
+            // Extract ID
+            const idText = cells.eq(idColIdx).text().trim();
+            const id = parseInt(idText, 10);
+            if (isNaN(id)) return;
+
+            // Skip duplicates
+            if (seenIds.has(id)) return;
+
+            // Extract sound name
+            let soundName = cells.eq(soundColIdx).text().trim();
+
+            // Clean up sound name (normalize whitespace to underscores)
+            soundName = soundName.replace(/\s+/g, '_');
+
+            if (!soundName) return;
+
+            seenIds.add(id);
+            entries.push({ id, name: soundName });
+        });
+    });
+
+    // Sort by ID for consistent file output
+    entries.sort((a, b) => a.id - b.id);
+
+    return entries;
+}
+
+/**
+ * Fetch and parse OSRS Wiki sound IDs, optionally write to file
+ * @param dryRun If true, parse only without writing
+ * @returns Update result statistics
+ */
+async function updateSoundIdsFromWiki(dryRun: boolean = false): Promise<UpdateSoundIdsResult> {
+    const wikiPageTitle = 'List_of_sound_IDs';
+
+    // Fetch the wiki page HTML
+    const response = await osrsApiClient.get('', {
+        params: {
+            action: 'parse',
+            page: wikiPageTitle,
+            prop: 'text',
+            formatversion: 2
+        }
+    });
+
+    const html = response.data?.parse?.text;
+    if (!html) {
+        throw new Error('Failed to fetch wiki page content');
+    }
+
+    // Parse the tables
+    const entries = parseSoundIdTables(html);
+
+    if (entries.length === 0) {
+        throw new Error('No sound ID entries found in wiki page');
+    }
+
+    // Validate we have enough entries (prevents partial data from overwriting good data)
+    if (entries.length < 1000) {
+        throw new Error(
+            `Only ${entries.length} entries found, expected 10,000+. ` +
+            `Wiki page structure may have changed.`
+        );
+    }
+
+    const result: UpdateSoundIdsResult = {
+        success: true,
+        entriesFound: entries.length,
+        idRange: {
+            min: entries[0].id,
+            max: entries[entries.length - 1].id
+        },
+        dryRun
+    };
+
+    if (!dryRun) {
+        // Build file content
+        const fileContent = entries
+            .map(entry => `${entry.id}\t${entry.name}`)
+            .join('\n');
+
+        // Write to file
+        const filePath = path.join(DATA_DIR, 'soundids.txt');
+        fs.writeFileSync(filePath, fileContent, 'utf8');
+
+        // Invalidate caches
+        fileCache.delete(filePath);
+        idIndexCache.delete(filePath);
+
+        result.entriesWritten = entries.length;
+        result.filePath = filePath;
+    }
+
+    return result;
+}
 
 const OsrsWikiSearchSchema = z.object({
     search: z.string().describe("The term to search for on the OSRS Wiki"),
@@ -469,7 +799,11 @@ const OsrsWikiGetPageInfoSchema = z.object({
 });
 
 const OsrsWikiParsePageSchema = z.object({
-    page: z.string().describe("The exact title of the wiki page to parse (e.g., 'Dragon scimitar', 'Abyssal whip'). Case-sensitive.")
+    page: z.string().describe("The exact title of the wiki page to parse (e.g., 'Dragon scimitar', 'Abyssal whip'). Case-sensitive."),
+    max_content_length: z.number().int().min(1000).max(100000).optional().default(25000)
+        .describe("Maximum length of markdown content in characters (1000-100000, default 25000). Content exceeding this limit will be truncated."),
+    sections: z.array(z.string()).optional()
+        .describe("Filter to specific section titles only. Case-insensitive partial matching. Example: ['Strategy', 'Equipment'] to get only those sections.")
 });
 
 const FileSearchSchema = z.object({
@@ -495,6 +829,30 @@ const ListDataFilesSchema = z.object({
 
 const GetByIdSchema = z.object({
     id: z.number().int().min(0).describe("The numeric ID to look up")
+});
+
+const UpdateSoundIdsSchema = z.object({
+    dryRun: z.boolean().optional().default(false)
+        .describe("If true, parse and return stats without writing to file")
+});
+
+// Phase 2 Schemas
+const BulkLookupSchema = z.object({
+    ids: z.array(z.number().int().min(0)).max(100)
+        .describe("Array of IDs to look up (max 100)")
+});
+
+const ExactMatchSchema = z.object({
+    name: z.string().describe("Exact name to match (case-insensitive)")
+});
+
+const GEPriceSchema = z.object({
+    itemId: z.number().int().min(0).describe("Item ID to get price for")
+});
+
+const GEPriceBulkSchema = z.object({
+    itemIds: z.array(z.number().int().min(0)).max(100)
+        .describe("Array of item IDs to get prices for (max 100)")
 });
 
 function convertZodToJsonSchema(schema: z.ZodType<any>) {
@@ -577,6 +935,36 @@ function searchFile(filePath: string, searchTerm: string, page: number = 1, page
             hasPreviousPage: page > 1
         }
     };
+}
+
+/**
+ * Find an entry by exact name match (case-insensitive)
+ * @param filePath Path to the file to search
+ * @param name Exact name to match
+ * @returns Object with the entry or null if not found
+ */
+function findByExactName(filePath: string, name: string): any {
+    const lines = getCachedFileLines(filePath);
+    const searchName = name.toLowerCase().replace(/ /g, '_');
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+
+        const parts = line.split(/\t/);
+        if (parts.length >= 2) {
+            const entryName = parts[1].toLowerCase();
+            if (entryName === searchName) {
+                return {
+                    id: parseInt(parts[0], 10),
+                    name: parts[1],
+                    lineNumber: i + 1,
+                    raw: line
+                };
+            }
+        }
+    }
+    return null;
 }
 
 /**
@@ -702,7 +1090,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             {
                 name: "osrs_wiki_parse_page",
-                description: "Get parsed content of an OSRS Wiki page. Returns structured JSON with infobox data (stats, combat info), drop tables with item/quantity/rarity, table of contents, and content as markdown.",
+                description: "Get parsed content of an OSRS Wiki page. Returns structured JSON with infobox data (stats, combat info), drop tables with item/quantity/rarity, table of contents, and content as markdown. Content is truncated to max_content_length (default 25000 chars) to prevent oversized responses. Use 'sections' parameter to filter to specific sections only (e.g., ['Strategy', 'Equipment']). Response includes 'contentMeta' with truncation info.",
                 inputSchema: convertZodToJsonSchema(OsrsWikiParsePageSchema),
             },
             {
@@ -810,6 +1198,154 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Get location/object definition by ID from loctypes.txt. Returns the location name and details for the given numeric ID.",
                 inputSchema: convertZodToJsonSchema(GetByIdSchema),
             },
+            {
+                name: "search_soundids",
+                description: "Search the soundids.txt file for sound effect IDs from the OSRS Wiki. Contains 10,000+ sound effect entries. Use update_soundids_from_wiki to download/update the data.",
+                inputSchema: convertZodToJsonSchema(FileSearchSchema),
+            },
+            {
+                name: "get_soundid_by_id",
+                description: "Get sound effect by ID from soundids.txt. Returns the sound name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "update_soundids_from_wiki",
+                description: "Update soundids.txt by fetching and parsing the OSRS Wiki 'List of sound IDs' page. Use dryRun=true to preview without writing. Downloads ~10,000 sound entries.",
+                inputSchema: convertZodToJsonSchema(UpdateSoundIdsSchema),
+            },
+            {
+                name: "get_varptype_by_id",
+                description: "Get player variable definition by ID from varptypes.txt. Returns the varp name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_varbittype_by_id",
+                description: "Get variable bit definition by ID from varbittypes.txt. Returns the varbit name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_iftype_by_id",
+                description: "Get interface definition by ID from iftypes.txt. Returns the interface name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_invtype_by_id",
+                description: "Get inventory type by ID from invtypes.txt. Returns the inventory name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_rowtype_by_id",
+                description: "Get row definition by ID from rowtypes.txt. Returns the row name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_soundtype_by_id",
+                description: "Get sound type by ID from soundtypes.txt. Returns the sound name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_spritetype_by_id",
+                description: "Get sprite definition by ID from spritetypes.txt. Returns the sprite name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            {
+                name: "get_tabletype_by_id",
+                description: "Get table definition by ID from tabletypes.txt. Returns the table name for the given numeric ID.",
+                inputSchema: convertZodToJsonSchema(GetByIdSchema),
+            },
+            // Phase 2: Bulk ID lookup tools
+            {
+                name: "get_npctypes_by_ids",
+                description: "Get multiple NPC definitions by IDs from npctypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_objtypes_by_ids",
+                description: "Get multiple item/object definitions by IDs from objtypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_seqtypes_by_ids",
+                description: "Get multiple animation sequences by IDs from seqtypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_spottypes_by_ids",
+                description: "Get multiple spot animations by IDs from spottypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_loctypes_by_ids",
+                description: "Get multiple location definitions by IDs from loctypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_varptypes_by_ids",
+                description: "Get multiple player variables by IDs from varptypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_varbittypes_by_ids",
+                description: "Get multiple variable bits by IDs from varbittypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_iftypes_by_ids",
+                description: "Get multiple interface definitions by IDs from iftypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_invtypes_by_ids",
+                description: "Get multiple inventory types by IDs from invtypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_rowtypes_by_ids",
+                description: "Get multiple row definitions by IDs from rowtypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_soundtypes_by_ids",
+                description: "Get multiple sound types by IDs from soundtypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_spritetypes_by_ids",
+                description: "Get multiple sprite definitions by IDs from spritetypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            {
+                name: "get_tabletypes_by_ids",
+                description: "Get multiple table definitions by IDs from tabletypes.txt. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(BulkLookupSchema),
+            },
+            // Phase 2: Exact match tools
+            {
+                name: "find_objtype_by_name",
+                description: "Find an item/object by exact name (case-insensitive) from objtypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_npctype_by_name",
+                description: "Find an NPC by exact name (case-insensitive) from npctypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            {
+                name: "find_loctype_by_name",
+                description: "Find a location/object by exact name (case-insensitive) from loctypes.txt. Spaces are converted to underscores.",
+                inputSchema: convertZodToJsonSchema(ExactMatchSchema),
+            },
+            // Phase 2: GE price tools
+            {
+                name: "osrs_ge_price",
+                description: "Get Grand Exchange price for an item by ID. Returns high/low prices and timestamps.",
+                inputSchema: convertZodToJsonSchema(GEPriceSchema),
+            },
+            {
+                name: "osrs_ge_prices",
+                description: "Get Grand Exchange prices for multiple items by IDs. Returns results array and notFound array.",
+                inputSchema: convertZodToJsonSchema(GEPriceBulkSchema),
+            },
         ]
     };
 });
@@ -835,6 +1371,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     return responseToString(cachedSearchData);
                 }
                 const searchResponse = await osrsApiClient.get('', { params: searchParams });
+                // Strip HTML tags from snippets
+                if (searchResponse.data?.query?.search) {
+                    searchResponse.data.query.search = searchResponse.data.query.search.map((result: any) => ({
+                        ...result,
+                        snippet: result.snippet?.replace(/<\/?span[^>]*>/g, '') || '',
+                        titlesnippet: result.titlesnippet?.replace(/<\/?span[^>]*>/g, '') || ''
+                    }));
+                }
                 setWikiCache(searchCacheKey, searchResponse.data);
                 return responseToString(searchResponse.data);
             }
@@ -857,14 +1401,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
 
             case "osrs_wiki_parse_page": {
-                const { page } = OsrsWikiParsePageSchema.parse(args);
+                const { page, max_content_length, sections: requestedSections } = OsrsWikiParsePageSchema.parse(args);
                 const parseParams = {
                     action: 'parse',
                     page: page,
                     prop: 'text|sections',
                     formatversion: 2
                 };
-                const parseCacheKey = getWikiCacheKey('wiki_parse_page', parseParams);
+
+                // Include new parameters in cache key for proper caching
+                const cacheParams = {
+                    ...parseParams,
+                    max_content_length,
+                    sections: requestedSections?.join(',') || ''
+                };
+                const parseCacheKey = getWikiCacheKey('wiki_parse_page', cacheParams);
                 const cachedParseData = getFromWikiCache(parseCacheKey);
                 if (cachedParseData) {
                     return responseToString(cachedParseData);
@@ -879,19 +1430,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
                 const infobox = extractInfobox(rawHtml);
                 const dropTable = extractDropTable(rawHtml);
-                const content = cleanAndConvertHtml(rawHtml);
+                let content = cleanAndConvertHtml(rawHtml);
                 const sections = parseResponse.data?.parse?.sections?.map((s: any) => ({
                     level: s.level,
                     title: s.line,
                     anchor: s.anchor
                 })) || [];
 
-                const parseResult = {
+                // Apply section filtering if requested
+                if (requestedSections && requestedSections.length > 0) {
+                    content = extractSections(content, requestedSections);
+                }
+
+                // Apply content truncation
+                const truncateResult = truncateContent(content, max_content_length);
+
+                const parseResult: Record<string, any> = {
                     page: page,
                     infobox: infobox,
                     dropTable: dropTable.length > 0 ? dropTable : null,
                     sections: sections,
-                    content: content
+                    content: truncateResult.content,
+                    contentMeta: {
+                        originalLength: truncateResult.originalLength,
+                        truncated: truncateResult.truncated,
+                        ...(truncateResult.truncatedAtSection && { truncatedAtSection: truncateResult.truncatedAtSection }),
+                        ...(requestedSections && requestedSections.length > 0 && { filteredSections: requestedSections })
+                    }
                 };
                 setWikiCache(parseCacheKey, parseResult);
                 return responseToString(parseResult);
@@ -1018,6 +1583,150 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 return responseToString(locEntry);
             }
 
+            case "search_soundids": {
+                const { query, page: soundPage = 1, pageSize: soundPageSize = 10 } = FileSearchSchema.parse(args);
+                const soundIdsFilePath = path.join(DATA_DIR, 'soundids.txt');
+                if (!fileExists('soundids.txt')) {
+                    return responseToString({
+                        error: 'soundids.txt not found in data directory. Use update_soundids_from_wiki to download.'
+                    });
+                }
+                const soundResults = searchFile(soundIdsFilePath, query, soundPage, soundPageSize);
+                return responseToString(soundResults);
+            }
+
+            case "get_soundid_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const soundIdFilePath = path.join(DATA_DIR, 'soundids.txt');
+                if (!fileExists('soundids.txt')) {
+                    return responseToString({
+                        error: 'soundids.txt not found in data directory. Use update_soundids_from_wiki to download.'
+                    });
+                }
+                const soundEntry = getEntryById(soundIdFilePath, id);
+                if (soundEntry === null) {
+                    return responseToString({ error: `Sound ID ${id} not found` });
+                }
+                return responseToString(soundEntry);
+            }
+
+            case "update_soundids_from_wiki": {
+                const { dryRun = false } = UpdateSoundIdsSchema.parse(args);
+                try {
+                    const result = await updateSoundIdsFromWiki(dryRun);
+                    return responseToString(result);
+                } catch (error) {
+                    const err = error as Error;
+                    return responseToString({
+                        error: `Failed to update sound IDs: ${err.message}`
+                    });
+                }
+            }
+
+            case "get_varptype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'varptypes.txt');
+                if (!fileExists('varptypes.txt')) {
+                    return responseToString({ error: 'varptypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Varp with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_varbittype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'varbittypes.txt');
+                if (!fileExists('varbittypes.txt')) {
+                    return responseToString({ error: 'varbittypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Varbit with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_iftype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'iftypes.txt');
+                if (!fileExists('iftypes.txt')) {
+                    return responseToString({ error: 'iftypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Interface with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_invtype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'invtypes.txt');
+                if (!fileExists('invtypes.txt')) {
+                    return responseToString({ error: 'invtypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Inventory with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_rowtype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'rowtypes.txt');
+                if (!fileExists('rowtypes.txt')) {
+                    return responseToString({ error: 'rowtypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Row with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_soundtype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'soundtypes.txt');
+                if (!fileExists('soundtypes.txt')) {
+                    return responseToString({ error: 'soundtypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Sound type with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_spritetype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'spritetypes.txt');
+                if (!fileExists('spritetypes.txt')) {
+                    return responseToString({ error: 'spritetypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Sprite with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
+            case "get_tabletype_by_id": {
+                const { id } = GetByIdSchema.parse(args);
+                const filePath = path.join(DATA_DIR, 'tabletypes.txt');
+                if (!fileExists('tabletypes.txt')) {
+                    return responseToString({ error: 'tabletypes.txt not found in data directory' });
+                }
+                const entry = getEntryById(filePath, id);
+                if (entry === null) {
+                    return responseToString({ error: `Table with ID ${id} not found` });
+                }
+                return responseToString(entry);
+            }
+
             default:
                 throw new Error(`Unknown tool: ${name}`);
         }
@@ -1058,10 +1767,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 async function main() {
     try {
-        //console.log("Starting MCP OSRS Server...");
+        // Optional startup refresh of sound IDs from wiki
+        if (REFRESH_SOUNDIDS_ON_STARTUP) {
+            try {
+                console.error('[mcp-osrs] Refreshing sound IDs from wiki...');
+                const result = await updateSoundIdsFromWiki(false);
+                console.error(`[mcp-osrs] Sound IDs updated: ${result.entriesWritten} entries`);
+            } catch (error) {
+                const err = error as Error;
+                console.error(`[mcp-osrs] Failed to refresh sound IDs: ${err.message}`);
+                // Non-fatal: continue startup even if refresh fails
+            }
+        }
+
         const transport = new StdioServerTransport();
         await server.connect(transport);
-        //console.log("MCP OSRS Server running on stdio");
     } catch (error) {
         console.error("Error during startup:", error);
         process.exit(1);
